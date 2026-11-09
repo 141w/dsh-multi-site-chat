@@ -106,6 +106,15 @@ dsh plugin --profile desktop add /absolute/path/dsh-deepseek-chat-0.2.20.tgz
 - **草稿与刷新：**模式切换会保留网页，但刷新、停用、卸载或退出 DSH 前，请先保留未发送内容。插件不会额外备份草稿。
 - **快捷键与网页能力：**Harness 原有的新会话快捷键和菜单仍作用于 HARNESS；CHAT 请使用其顶部“新会话”按钮。附件保存只覆盖 Mermaid 代码块的 SVG/PNG/源码导出；其他下载、设备权限和部分弹窗仍受 DSH 的浏览器安全策略限制。
 
+## 来源与致谢
+
+- 本项目是 **DeepSeek Harness 的第三方非官方插件**，与 DeepSeek 官方无从属关系，也未获其认可或背书。
+- 基于 [xingxingbk-git/dsh-deepseek-chat](https://github.com/xingxingbk-git/dsh-deepseek-chat) 开发，上游作者为 xingxingbk；本仓库为其分支（见 GitHub 页面上的 "forked from"）。原上游未附许可证，本仓库以 MIT 许可发布并保留上游版权行。
+- 平台与框架：[DeepSeek Harness](https://www.deepseek.com/harness/en/)、[@deepseek-ai/cordis](https://github.com/deepseek-ai/cordis)（MIT）。
+- 开发参考：[dsh-plugin-dev-guide](https://github.com/anweat/dsh-plugin-dev-guide)（第三方指南，自述基于官方文档整理）。
+- 界面中的 DeepSeek 鲸鱼图标取自 DeepSeek 官网，商标归 DeepSeek 所有，此处仅作识别性使用。
+- 感谢所有通过 Issue 与 PR 贡献过的开发者。
+
 ## 隐私与数据
 
 聊天内容和账号历史由 DeepSeek 官网处理。插件为显示账号与导航，读取官网可见的昵称、对话标题、分组和链接；这些导航信息仅在当前登录期间保留于内存。

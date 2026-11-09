@@ -106,6 +106,15 @@ Replace the path with your package location.
 - **Drafts and refresh:** Switching modes retains the website page, but preserve unsent text before refreshing, disabling, uninstalling or quitting DSH. The plugin does not separately back up drafts.
 - **Shortcuts and website capabilities:** Existing Harness new-session shortcuts and menus still act on HARNESS. Use CHAT’s top New Chat button for website conversations. Attachment saving covers only the SVG/PNG/source export of Mermaid code blocks; other downloads, device permissions and some popups remain limited by DSH’s browser security policies.
 
+## Credits and provenance
+
+- This is an **unofficial third-party plugin for DeepSeek Harness**. It is not affiliated with, endorsed by, or sponsored by DeepSeek.
+- Developed from [xingxingbk-git/dsh-deepseek-chat](https://github.com/xingxingbk-git/dsh-deepseek-chat) by xingxingbk; this repository is a fork of it (see “forked from” on the repository page). The upstream carried no license; this repository is published under the MIT License and keeps the upstream copyright line.
+- Platform and framework: [DeepSeek Harness](https://www.deepseek.com/harness/en/), [@deepseek-ai/cordis](https://github.com/deepseek-ai/cordis) (MIT).
+- Development reference: [dsh-plugin-dev-guide](https://github.com/anweat/dsh-plugin-dev-guide), a third-party guide that states it was compiled from the official documentation.
+- The DeepSeek whale artwork in the interface comes from the DeepSeek website. The trademark belongs to DeepSeek and is used here for identification only.
+- Thanks to everyone who has contributed through issues and pull requests.
+
 ## Privacy and data
 
 DeepSeek’s website handles chats and account history. To display the account and navigation, the plugin reads visible account names, conversation titles, groups and links. Navigation information is kept only in memory during the current sign-in session.

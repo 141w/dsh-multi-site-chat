@@ -2,13 +2,14 @@
   "name": "dsh-deepseek-chat",
   "version": "0.2.20",
   "description": "CHAT / HARNESS mode switcher for DeepSeek Harness",
+  "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xingxingbk-git/dsh-deepseek-chat.git"
+    "url": "git+https://github.com/141w/dsh-deepseek-chat.git"
   },
-  "homepage": "https://github.com/xingxingbk-git/dsh-deepseek-chat#readme",
+  "homepage": "https://github.com/141w/dsh-deepseek-chat#readme",
   "bugs": {
-    "url": "https://github.com/xingxingbk-git/dsh-deepseek-chat/issues"
+    "url": "https://github.com/141w/dsh-deepseek-chat/issues"
   },
   "keywords": [
     "dsh",
@@ -86,7 +87,7 @@
     }
   },
   "peerDependencies": {
-"@deepseek-ai/cordis": "^4.0.4 || ^4.1.0",
+    "@deepseek-ai/cordis": "^4.0.4 || ^4.1.0",
     "@deepseek-ai/dsh-credentials": "0.2.0-rc.2 || >=0.2.1-rc.1 <0.2.2-0 || >=0.2.2-rc.1 <0.2.3-0",
     "@deepseek-ai/dsh-typert-protocol": "0.2.0-rc.2 || >=0.2.1-rc.1 <0.2.2-0 || >=0.2.2-rc.1 <0.2.3-0",
     "@deepseek-ai/dsh-typert-registry": "0.2.0-rc.2 || >=0.2.1-rc.1 <0.2.2-0 || >=0.2.2-rc.1 <0.2.3-0",
