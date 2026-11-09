@@ -68,13 +68,13 @@ Use the same method for a first installation or an update. If DSH’s release ag
 Paste this URL into the DSH plugin installer:
 
 ```text
-https://github.com/141w/dsh-deepseek-chat
+https://github.com/141w/dsh-multi-site-chat
 ```
 
 Or use the CLI:
 
 ```bash
-dsh plugin --profile desktop add https://github.com/141w/dsh-deepseek-chat
+dsh plugin --profile desktop add https://github.com/141w/dsh-multi-site-chat
 ```
 
 This installs the version already pushed to the repository, with no manual build required. Git must be installed; on Windows, install [Git for Windows](https://git-scm.com/install/windows) if needed, then reopen DSH.

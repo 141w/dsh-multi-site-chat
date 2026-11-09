@@ -68,13 +68,13 @@ dsh plugin --profile desktop add dsh-multi-site-chat@0.2.20
 在 DSH 插件安装输入框中粘贴：
 
 ```text
-https://github.com/141w/dsh-deepseek-chat
+https://github.com/141w/dsh-multi-site-chat
 ```
 
 或使用命令行：
 
 ```bash
-dsh plugin --profile desktop add https://github.com/141w/dsh-deepseek-chat
+dsh plugin --profile desktop add https://github.com/141w/dsh-multi-site-chat
 ```
 
 此方式安装仓库中已推送的版本，无需手动构建。需要系统已安装 Git；Windows 可先安装 [Git for Windows](https://git-scm.com/install/windows)，再重开 DSH。

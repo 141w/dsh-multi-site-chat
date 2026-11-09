@@ -5,11 +5,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/141w/dsh-deepseek-chat.git"
+    "url": "git+https://github.com/141w/dsh-multi-site-chat.git"
   },
-  "homepage": "https://github.com/141w/dsh-deepseek-chat#readme",
+  "homepage": "https://github.com/141w/dsh-multi-site-chat#readme",
   "bugs": {
-    "url": "https://github.com/141w/dsh-deepseek-chat/issues"
+    "url": "https://github.com/141w/dsh-multi-site-chat/issues"
   },
   "keywords": [
     "dsh",
