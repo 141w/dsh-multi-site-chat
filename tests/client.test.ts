@@ -1,3 +1,4 @@
+
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import type { Context } from '@deepseek-ai/cordis'
@@ -14,7 +15,7 @@ const fictionalSession: WebsiteSession = {
   token: 'fictional-website-token', userId: 'fictional-website-user',
   deviceId: '00000000-0000-4000-8000-000000000001',
 }
-const readyNavigation = { status: 'ready' as const, conversations: [], selectedHref: null, canCreate: true, error: null }
+const readyNavigation = { status: 'ready' as const, authenticated: true, accountName: 'Fictional fixture', conversations: [], selectedHref: null, canCreate: true, error: null }
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -24,13 +25,14 @@ function deferred<T>() {
 }
 
 /** Cordis nested-effect and declared-Slot fixtures; no native guest or webpage runs. */
-function harness(originalPanel: string | null = 'plugins', failMount = false, saved?: {language:string}) {
+function harness(originalPanel: string | null = 'plugins', failMount = false, saved?: Record<string, string>) {
   type Dispose = () => void | Promise<void>
   const rootEffects: Dispose[] = []
   let collector = rootEffects
   const setup: Promise<unknown>[] = []
   const order: string[] = []
-  const registrations = new Map<string, { inject: () => { bridge: DshChatUIBridge } }>()
+  const registrations = new Map<string, { name: string; inject: () => { bridge: DshChatUIBridge } }>()
+  const slotListeners = new Map<string, Set<() => void>>()
   const panelListeners = new Set<() => void>()
   let panel = originalPanel
   const requests: ReturnType<typeof deferred<{ ok: true; value: AuthorizationState }>>[] = []
@@ -95,12 +97,17 @@ function harness(originalPanel: string | null = 'plugins', failMount = false, sa
     })
   }
   const prefListeners=new Set<()=>void>();const writes: [string,string][]=[]
-  const form={getSnapshot:()=>({status:'ready',value:saved}),subscribe:(fn:()=>void)=>{prefListeners.add(fn);return()=>prefListeners.delete(fn)},set:async(key:string,value:string)=>{writes.push([key,value]);saved={...saved!,[key]:value};for(const fn of prefListeners)fn();return true}}
+  let formStatus:'ready'|'unavailable'='ready'
+  const form={getSnapshot:()=>({status:formStatus,writable:formStatus==='ready',value:saved}),subscribe:(fn:()=>void)=>{prefListeners.add(fn);return()=>prefListeners.delete(fn)},set:async(key:string,value:string)=>{writes.push([key,value]);saved={...saved!,[key]:value};for(const fn of prefListeners)fn();return true}}
   const ctx = {
-    configForms:{get:(ns:string)=>{assert.equal(ns,'dsh-chat');return form}},
+    configForms:{get:(ns:string)=>{assert.equal(ns,'deepseek-chat');return form}},
     effect,
+    // The upstream download feature injects the public file-actions service; the
+    // stub reports that saving is unavailable so no export path is exercised.
+    fileActions: { canSaveAs: false, save: async () => ({ status: 'rejected' }) },
     inject: (dependencies: string[], callback: (ctx: unknown) => unknown) => {
-      assert.deepEqual(dependencies, dependencies[0]==='configForms' ? ['configForms'] : ['remote', 'remote.dshChat'])
+      assert.deepEqual(dependencies, dependencies[0]==='configForms' ? ['configForms']
+        : dependencies[0]==='fileActions' ? ['fileActions'] : ['remote', 'remote.dshDeepseekChat'])
       if(dependencies[0]==='configForms' && !saved) return {dispose:async()=>{},then:(fulfilled:()=>unknown)=>Promise.resolve().then(fulfilled)}
       const dispose = effect(() => callback(ctx))
       return { dispose, then: (fulfilled: () => unknown) => Promise.resolve().then(fulfilled) }
@@ -110,7 +117,17 @@ function harness(originalPanel: string | null = 'plugins', failMount = false, sa
       register: (options: { name: string; key?: string; id?: string; inject: () => { bridge: DshChatUIBridge } }) => {
         const key = `${options.name}:${options.key ?? options.id ?? ''}`
         registrations.set(key, options)
-        return effect(() => () => { registrations.delete(key); order.push(`unregister:${key}`) })
+        for (const listener of slotListeners.get(options.name) ?? []) listener()
+        return effect(() => () => {
+          registrations.delete(key); order.push(`unregister:${key}`)
+          for (const listener of slotListeners.get(options.name) ?? []) listener()
+        })
+      },
+      entries: (name: string) => [...registrations.values()].filter(entry => entry.name === name),
+      subscribe: (name: string, listener: () => void) => {
+        const listeners = slotListeners.get(name) ?? new Set<() => void>()
+        slotListeners.set(name, listeners); listeners.add(listener)
+        return () => { listeners.delete(listener) }
       },
     },
     layout: {
@@ -128,7 +145,7 @@ function harness(originalPanel: string | null = 'plugins', failMount = false, sa
         return () => { order.push('remote:unmount') }
       },
       $stream: () => stream,
-      dshChat: {
+      dshDeepseekChat: {
         authorization: () => { const value = deferred<{ ok: true; value: AuthorizationState }>(); requests.push(value); return value.promise },
         loadWebsiteSession: (metadata: object, epoch: string, signal: AbortSignal) => {
           assert.deepEqual(metadata, { version: '0.2.0-rc.2', locale: globalThis.navigator?.language ?? 'zh-CN', timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60 })
@@ -146,6 +163,13 @@ function harness(originalPanel: string | null = 'plugins', failMount = false, sa
       },
     },
   }
+  const storedSites: string[] = []
+  const siteStorage = {
+    getItem: (key: string) => (key === 'dsh-deepseek-chat.site' && storedSites.length ? storedSites[storedSites.length - 1] : null),
+    setItem: (_key: string, value: string) => { storedSites.push(value) },
+  }
+  const previousLocalStorage = (globalThis as typeof globalThis & { localStorage?: unknown }).localStorage
+  ;(globalThis as typeof globalThis & { localStorage?: unknown }).localStorage = siteStorage
   const product = globalThis as typeof globalThis & { dshDesktop?: unknown }
   const previousDesktop = product.dshDesktop
   const previousAdd = globalThis.addEventListener
@@ -157,7 +181,8 @@ function harness(originalPanel: string | null = 'plugins', failMount = false, sa
   const bridge = registrations.get(`main:${CHAT_PANEL}`)!.inject().bridge
   let cleaned = false
   return {
-    bridge, order, requests, writes, sessionCalls, sessionReplies, panel: () => panel, registrations: () => [...registrations.keys()],
+    bridge, order, requests, writes, sessionCalls, sessionReplies, panel: () => panel, registrations: () => [...registrations.keys()], storedSites,
+    formUnavailable: () => { formStatus = 'unavailable'; for (const fn of prefListeners) fn() },
     async ready() { await flush(); await Promise.all(setup); await flush() },
     emit(value: AuthorizationState, aborted = false) {
       const controller = new AbortController()
@@ -176,6 +201,8 @@ function harness(originalPanel: string | null = 'plugins', failMount = false, sa
         else product.dshDesktop = previousDesktop
         globalThis.addEventListener = previousAdd
         globalThis.removeEventListener = previousRemove
+        if (previousLocalStorage === undefined) delete (globalThis as typeof globalThis & { localStorage?: unknown }).localStorage
+        else (globalThis as typeof globalThis & { localStorage?: unknown }).localStorage = previousLocalStorage
       }
     },
   }
@@ -187,7 +214,6 @@ test('Chat swaps navigation and collapsed chrome, then restores both native seat
     await h.ready()
     h.requests[0].resolve({ok:true,value:authorized()}); await flush()
     h.bridge.selectMode('chat'); await flush()
-    h.requests[1].resolve({ok:true,value:authorized()}); await flush()
     assert(h.registrations().includes('sidebar.workspaces:'))
     assert(!h.registrations().includes('sidebar:'))
     assert(h.registrations().includes('shell.leading:'))
@@ -200,16 +226,62 @@ test('Chat swaps navigation and collapsed chrome, then restores both native seat
   } finally { await h.dispose() }
 })
 
+test('adding a website publishes it so the switcher and settings can see it', async () => {
+  const h = harness()
+  try {
+    await h.ready()
+    h.requests[0].resolve({ ok: true, value: authorized() }); await flush()
+    h.bridge.selectMode('chat'); await flush()
+    // The storage stub starts empty, so nothing is published yet.
+    assert.deepEqual(h.bridge.getSnapshot().customSites, [])
+    assert.equal(h.bridge.addCustomSite('Kimi', 'https://kimi.com/'), true)
+    const published = h.bridge.getSnapshot().customSites ?? []
+    assert.equal(published.length, 1)
+    assert.equal(published[0].id, 'custom-kimi-com')
+    assert.equal(published[0].label, 'Kimi')
+    assert.equal(published[0].url, 'https://kimi.com/')
+    // A duplicate or a non-https URL is refused and changes nothing.
+    assert.equal(h.bridge.addCustomSite('Kimi again', 'https://kimi.com/'), false)
+    assert.equal(h.bridge.addCustomSite('bad', 'http://kimi.com/'), false)
+    assert.equal((h.bridge.getSnapshot().customSites ?? []).length, 1)
+    h.bridge.removeCustomSite('custom-kimi-com')
+    assert.equal((h.bridge.getSnapshot().customSites ?? []).length, 0)
+  } finally { await h.dispose() }
+})
+test('a transient empty report keeps the last known conversation list', async () => {
+  const h = harness()
+  try {
+    await h.ready()
+    h.requests[0].resolve({ ok: true, value: authorized() }); await flush()
+    h.bridge.selectMode('chat'); await flush()
+    const generation = h.bridge.getSnapshot().authorizationGeneration
+    const href = '/c/fixture-conversation'
+      h.bridge.reportWebsiteNavigation(generation, { status: 'ready', authenticated: true, conversations: [{ href, title: 'Fixture A', group: '对话' }], selectedHref: href, canCreate: true, error: null })
+      // The site's own sidebar was collapsed: its links leave the document.
+      h.bridge.reportWebsiteNavigation(generation, { status: 'unsupported', conversations: [], selectedHref: null, canCreate: false, error: null })
+      const kept = h.bridge.getSnapshot().websiteNavigation
+      assert.equal(kept.status, 'ready')
+      assert.deepEqual(kept.conversations.map(item => item.href), [href])
+      // The reload that follows a conversation click is a fresh document:
+      // within the same site the list still survives it.
+      h.bridge.reportWebsiteNavigation(generation, { status: 'unsupported', conversations: [], selectedHref: null, canCreate: false, error: null }, true)
+      assert.equal(h.bridge.getSnapshot().websiteNavigation.status, 'ready')
+      assert.deepEqual(h.bridge.getSnapshot().websiteNavigation.conversations.map(item => item.href), [href])
+      // A sign-in report still clears it.
+      h.bridge.reportWebsiteNavigation(generation, { status: 'sign-in', conversations: [], selectedHref: null, canCreate: false, error: null })
+      assert.equal(h.bridge.getSnapshot().websiteNavigation.conversations.length, 0)
+    } finally { await h.dispose() }
+})
+
 test('website list and action binding are invalidated at account change and late guest replies are ignored', async () => {
   const h = harness()
   try {
     await h.ready()
     h.requests[0].resolve({ok:true,value:authorized()}); await flush()
     h.bridge.selectMode('chat'); await flush()
-    h.requests[1].resolve({ok:true,value:authorized()}); await flush()
     const generation = h.bridge.getSnapshot().authorizationGeneration
     const href = 'https://chat.deepseek.com/a/chat/s/fixture-a'
-    h.bridge.reportWebsiteNavigation(generation, {status:'ready',conversations:[{href,title:'Fixture A',group:'置顶'}],selectedHref:href,canCreate:true,error:null})
+    h.bridge.reportWebsiteNavigation(generation, {status:'ready',authenticated:true,accountName:'Fictional fixture',conversations:[{href,title:'Fixture A',group:'置顶'}],selectedHref:href,canCreate:true,error:null})
     let called = 0
     h.bridge.bindWebsiteNavigation(generation, async () => { called++ })
     h.bridge.commandWebsite({type:'open',href:'https://example.com/'}); await flush()
@@ -218,19 +290,17 @@ test('website list and action binding are invalidated at account change and late
     assert.equal(called,1)
     h.bridge.toggleWebsiteNavigation()
     assert.equal(h.bridge.getSnapshot().showWebsiteNavigation,true)
-    h.bridge.commandWebsite({type:'settings-read'}); await flush()
-    assert.equal(h.bridge.getSnapshot().showWebsiteNavigation,false)
-    assert.equal(called,2)
     h.emit(authorized('B','grant-b')); await flush()
     assert.equal(h.bridge.getSnapshot().websiteNavigation.conversations.length,0)
-    h.bridge.reportWebsiteNavigation(generation,{status:'ready',conversations:[{href,title:'stale',group:'置顶'}]})
+    h.bridge.reportWebsiteNavigation(generation,{status:'ready',authenticated:true,accountName:'Fictional fixture',conversations:[{href,title:'stale',group:'置顶'}]})
     h.bridge.commandWebsite({type:'new'}); await flush()
-    assert.equal(called,2)
+    // The stale generation cannot open conversations or create a new one.
+    assert.equal(called,1)
     assert.equal(h.bridge.getSnapshot().websiteNavigation.conversations.length,0)
   } finally { await h.dispose() }
 })
 
-test('a late valid HTTP snapshot cannot reopen the Client gate after stream sign-out', async () => {
+test('a late valid HTTP snapshot cannot re-authorize after a stream sign-out', async () => {
   const h = harness()
   try {
     await h.ready()
@@ -239,21 +309,24 @@ test('a late valid HTTP snapshot cannot reopen the Client gate after stream sign
     h.bridge.refreshAuthorization(); await flush()
     const stale = h.requests[1]
     h.emit(signedOut()); await flush()
-    stale.resolve({ ok: true, value: authorized() }); await flush()
-    assert.equal(h.bridge.getSnapshot().modeEnabled, false)
     assert.equal(h.bridge.getSnapshot().authorizationStatus, 'unauthorized')
+    stale.resolve({ ok: true, value: authorized() }); await flush()
+    // The late reply belongs to a replaced generation and must not re-authorize.
+    assert.equal(h.bridge.getSnapshot().authorizationStatus, 'unauthorized')
+    assert.equal(h.bridge.getSnapshot().modeEnabled, true)
+    assert.equal(h.bridge.getSnapshot().mode, 'harness')
     assert.equal(h.panel(), 'plugins')
   } finally { await h.dispose() }
 })
 
-test('direct unauthorized main entry retains the real prior panel; aborted stream items are ignored', async () => {
+test('direct main entry enters CHAT under the compatibility-only gate; aborted stream items are ignored', async () => {
   const h = harness('settings')
   try {
     await h.ready()
     h.navigate(CHAT_PANEL)
-    assert.equal(h.panel(), 'settings')
+    assert.equal(h.panel(), CHAT_PANEL)
+    assert.equal(h.bridge.getSnapshot().mode, 'chat')
     h.emit(authorized(), true); await flush()
-    assert.equal(h.bridge.getSnapshot().modeEnabled, false)
     assert.equal(h.order.includes('stream:accept'), false)
   } finally { await h.dispose() }
 })
@@ -264,7 +337,6 @@ test('Client unload restores Harness before removing its main key and disposes r
     await h.ready()
     h.requests[0].resolve({ ok: true, value: authorized() }); await flush()
     h.bridge.selectMode('chat'); await flush()
-    h.requests[1].resolve({ ok: true, value: authorized() }); await flush()
     assert.equal(h.panel(), CHAT_PANEL)
     h.emit(authorized()); await flush()
     assert.equal(h.bridge.getSnapshot().mode, 'chat')
@@ -278,28 +350,27 @@ test('Client unload restores Harness before removing its main key and disposes r
   } finally { await h.dispose() }
 })
 
-test('an account change while entering Chat cannot auto-enter the replacement account', async () => {
+test('an account change while in Chat keeps the mode and only retires the predecessor work', async () => {
   const h = harness()
   try {
     await h.ready()
     h.requests[0].resolve({ ok: true, value: authorized() }); await flush()
     h.bridge.selectMode('chat'); await flush()
     h.emit(authorized('B', 'grant-b')); await flush()
-    h.requests[1].resolve({ ok: true, value: authorized() }); await flush()
-    assert.equal(h.bridge.getSnapshot().mode, 'harness')
-    assert.equal(h.bridge.getSnapshot().accountStorageKey, 'dsh-chat:website:B')
-    assert.equal(h.panel(), 'plugins')
+    assert.equal(h.bridge.getSnapshot().mode, 'chat')
+    assert.equal(h.bridge.getSnapshot().accountStorageKey, 'dsh-deepseek-chat:website:B')
+    assert.equal(h.panel(), CHAT_PANEL)
   } finally { await h.dispose() }
 })
 
-test('initial remote failure leaves pending, keeps Harness gated, and can be retried', async () => {
+test('initial remote failure stays visible, keeps Harness, and can be retried', async () => {
   const h = harness()
   try {
     await h.ready()
     h.requests[0].reject(new Error('fixture connection failure')); await flush()
     assert.equal(h.bridge.getSnapshot().authorizationStatus, 'unavailable')
-    assert.equal(h.bridge.getSnapshot().modeEnabled, false)
-    assert.match(h.bridge.getSnapshot().error!, /刷新授权/)
+    assert.equal(h.bridge.getSnapshot().modeEnabled, true)
+    assert.match(h.bridge.getSnapshot().error!, /无法连接/)
     h.bridge.refreshAuthorization(); await flush()
     h.requests[1].resolve({ ok: true, value: authorized() }); await flush()
     assert.equal(h.bridge.getSnapshot().authorizationStatus, 'authorized')
@@ -331,10 +402,10 @@ test('a stalled initial check times out and its late result cannot reopen the ga
     assert.equal(h.bridge.getSnapshot().authorizationStatus, 'unavailable')
     assert.match(h.bridge.getSnapshot().error!, /超时/)
     h.requests[0].resolve({ ok: true, value: authorized() }); await flush()
-    assert.equal(h.bridge.getSnapshot().modeEnabled, false)
+    assert.equal(h.bridge.getSnapshot().modeEnabled, true)
     h.bridge.refreshAuthorization(); await flush()
     h.requests[1].resolve({ ok: true, value: authorized() }); await flush()
-    assert.equal(h.bridge.getSnapshot().modeEnabled, true)
+    assert.equal(h.bridge.getSnapshot().authorizationStatus, 'authorized')
   } finally { await h.dispose(); t.mock.timers.reset() }
 })
 
@@ -344,63 +415,62 @@ test('a transport failure preserves a confirmed account and the selected Chat mo
     await h.ready()
     h.requests[0].resolve({ ok: true, value: authorized() }); await flush()
     h.bridge.selectMode('chat'); await flush()
-    h.requests[1].resolve({ ok: true, value: authorized() }); await flush()
     assert.equal(h.bridge.getSnapshot().mode, 'chat')
     h.bridge.refreshAuthorization(); await flush()
-    h.requests[2].reject(new Error('fixture offline')); await flush()
+    h.requests[1].reject(new Error('fixture offline')); await flush()
     assert.equal(h.bridge.getSnapshot().mode, 'chat')
     assert.equal(h.bridge.getSnapshot().modeEnabled, true)
-    assert.match(h.bridge.getSnapshot().error!, /刷新授权/)
+    assert.match(h.bridge.getSnapshot().error!, /无法连接/)
   } finally { await h.dispose() }
 })
 
- test('native settings restores persisted preferences before saving guest defaults, then persists confirmed edits',async()=>{
-  const h=harness('plugins',false,{language:'zh-CN'})
+ test('switch preferences restore from the Host form and persist confirmed edits',async()=>{
+  const h=harness('plugins',false,{switchStyle:'text',chatLabel:'CHAT',harnessLabel:'CODE'})
   try {
-    await h.ready();h.requests[0].resolve({ok:true,value:authorized()});await flush()
-    h.bridge.updateSettingsViewport({left:100,top:100,width:500,height:400})
-    const generation=h.bridge.getSnapshot().authorizationGeneration
-    const commands:unknown[]=[]
-    h.bridge.bindWebsiteNavigation(generation,async command=>{commands.push(command)})
-    const navigation={status:'ready' as const,conversations:[],selectedHref:null,canCreate:true,error:null}
-    h.bridge.reportWebsiteNavigation(generation,{...navigation,settings:{language:'English',theme:'Dark',error:null,restored:true,pending:false}})
-    await flush();assert.deepEqual(commands,[{type:'preferences',language:'zh-CN'},{type:'settings-read'}]);assert.deepEqual(h.writes,[])
-    h.bridge.reportWebsiteNavigation(generation,{...navigation,settings:{language:'English',theme:'Dark',error:null,restored:false,pending:true}})
-    h.bridge.reportWebsiteNavigation(generation,{...navigation,settings:{language:'简体中文',theme:'Dark',error:null,restored:true,pending:false}})
-    await flush();assert.deepEqual(h.writes,[])
-    h.bridge.reportWebsiteNavigation(generation,{...navigation,settings:{language:'English',theme:'Dark',error:null,restored:true,pending:false}})
-    await flush();assert.deepEqual(h.writes,[['language','en']])
-    h.bridge.commandWebsite({type:'setting',key:'language',value:'en'});await flush();assert.deepEqual(commands.at(-1),{type:'setting',key:'language',value:'en'})
-    h.bridge.updateSettingsViewport(null);await flush();assert.deepEqual(commands.at(-1),{type:'settings-close'})
+    await h.ready()
+    assert.equal(h.bridge.getSnapshot().switchPreferencesStatus,'ready')
+    assert.deepEqual(h.bridge.getSnapshot().switchPreferences,{switchStyle:'text',chatLabel:'CHAT',harnessLabel:'CODE'})
+    assert.deepEqual(h.writes,[])
+    assert.equal(await h.bridge.setSwitchPreference!('harnessLabel','工作区'),true)
+    assert.deepEqual(h.writes,[['harnessLabel','工作区']])
+    assert.deepEqual(h.bridge.getSnapshot().switchPreferences,{switchStyle:'text',chatLabel:'CHAT',harnessLabel:'工作区'})
+    assert.equal(h.bridge.getSnapshot().switchPreferencesError,null)
+    assert.equal(h.bridge.getSnapshot().switchPreferencesPending,false)
+    // A withdrawn settings service surfaces a retryable error instead of a silent drop.
+    h.formUnavailable!()
+    assert.equal(h.bridge.getSnapshot().switchPreferencesStatus,'unavailable')
+    assert.equal(await h.bridge.setSwitchPreference!('chatLabel','CHAT'),false)
+    assert.deepEqual(h.writes,[['harnessLabel','工作区']])
   }finally{await h.dispose()}
  })
- test('explicit current website logout returns Harness and gates Chat until website sign-in succeeds',async()=>{
+ test('explicit current website logout clears the vault first and keeps Chat available',async()=>{
   const h=harness()
   try {
     await h.ready();h.requests[0].resolve({ok:true,value:authorized()});await flush()
-    h.bridge.selectMode('chat');await flush();h.requests[1].resolve({ok:true,value:authorized()});await flush()
+    h.bridge.selectMode('chat'); await flush()
     const generation=h.bridge.getSnapshot().authorizationGeneration;const commands:unknown[]=[]
     h.bridge.bindWebsiteNavigation(generation,async c=>{commands.push(c);h.order.push(`website:${c.type}`)})
     h.bridge.reportWebsiteNavigation(generation,readyNavigation)
-    h.bridge.logoutWebsite();await flush();assert.deepEqual(commands.at(-1),{type:'logout'})
+    console.error('DBG after report', JSON.stringify({auth:h.bridge.getSnapshot().websiteAuthenticationStatus,nav:h.bridge.getSnapshot().websiteNavigation.status,navAuth:h.bridge.getSnapshot().websiteNavigation.authenticated,gen:h.bridge.getSnapshot().authorizationGeneration,captured:generation}))
+    h.bridge.logoutWebsite();await flush();console.error('DBG logout state', JSON.stringify({status:h.bridge.getSnapshot().websiteSessionStatus,error:h.bridge.getSnapshot().websiteSessionError,auth:h.bridge.getSnapshot().websiteAuthenticationStatus,commands,sessionCalls:h.sessionCalls.map(c=>c.method)}))
     assert.deepEqual(h.sessionCalls.map(call=>({method:call.method,epoch:call.epoch})),[{method:'clear',epoch:'grant-a'}])
     assert(h.order.indexOf('session:clear')<h.order.indexOf('website:logout'))
     h.bridge.reportWebsiteNavigation(generation,{status:'sign-in',conversations:[],selectedHref:null,canCreate:false,error:null})
-    assert.equal(h.bridge.getSnapshot().mode,'harness');assert.equal(h.bridge.getSnapshot().modeEnabled,false)
-    h.bridge.selectMode('chat');await flush();assert.equal(h.bridge.getSnapshot().mode,'harness')
+    assert.equal(h.bridge.getSnapshot().mode,'chat');assert.equal(h.bridge.getSnapshot().modeEnabled,true)
+    h.bridge.selectMode('chat');await flush();assert.equal(h.bridge.getSnapshot().mode,'chat')
     h.bridge.reportWebsiteNavigation(generation,{status:'ready',conversations:[],selectedHref:null,canCreate:true,error:null})
     assert.equal(h.bridge.getSnapshot().modeEnabled,true)
   }finally{await h.dispose()}
  })
 
- test('an observed website sign-out after ready falls back even across an intervening load',async()=>{
+ test('an observed website sign-out after ready keeps the selected mode across an intervening load',async()=>{
   const h=harness()
   try{
     await h.ready();h.requests[0].resolve({ok:true,value:authorized()});await flush()
-    h.bridge.selectMode('chat');await flush();h.requests[1].resolve({ok:true,value:authorized()});await flush()
+    h.bridge.selectMode('chat'); await flush()
     const generation=h.bridge.getSnapshot().authorizationGeneration
     for(const status of ['ready','loading','sign-in'] as const) h.bridge.reportWebsiteNavigation(generation,{status,conversations:[],selectedHref:null,canCreate:status==='ready',error:null})
-    assert.equal(h.bridge.getSnapshot().mode,'harness');assert.equal(h.bridge.getSnapshot().modeEnabled,false)
+    assert.equal(h.bridge.getSnapshot().mode,'chat');assert.equal(h.bridge.getSnapshot().modeEnabled,true)
   }finally{await h.dispose()}
  })
 
@@ -409,7 +479,6 @@ async function enterChat(h: ReturnType<typeof harness>) {
   await h.ready()
   h.requests[0].resolve({ ok: true, value: authorized() }); await flush()
   h.bridge.selectMode('chat'); await flush()
-  h.requests[1].resolve({ ok: true, value: authorized() }); await flush()
   const generation = h.bridge.getSnapshot().authorizationGeneration
   h.bridge.reportWebsiteNavigation(generation, readyNavigation)
   return generation
@@ -461,7 +530,8 @@ test('explicit logout waits for an in-flight save, blocks recovery, then clears 
     h.bridge.reportWebsiteNavigation(generation, { ...readyNavigation, status: 'sign-in', canCreate: false })
     assert.equal(await h.bridge.loadWebsiteSession(generation), null)
     assert.equal(await h.bridge.saveWebsiteSession(generation, fictionalSession), false)
-    assert.equal(h.bridge.getSnapshot().mode, 'harness')
+    // Website sign-out keeps the selected mode; only the session is gone.
+    assert.equal(h.bridge.getSnapshot().mode, 'chat')
   } finally { await h.dispose() }
 })
 
@@ -490,7 +560,7 @@ for (const failure of ['refused', 'rejected'] as const) {
       h.bridge.logoutWebsite(); await flush(); await flush()
       assert.deepEqual(commands, [{ type: 'logout' }])
       h.bridge.reportWebsiteNavigation(generation, { ...readyNavigation, status: 'sign-in', canCreate: false })
-      assert.equal(h.bridge.getSnapshot().modeEnabled, false)
+      assert.equal(h.bridge.getSnapshot().modeEnabled, true)
     } finally { await h.dispose() }
   })
 }
@@ -548,4 +618,34 @@ test('a timed-out website save aborts its request and a late success never repor
     assert.equal(h.bridge.getSnapshot().websiteSessionStatus, 'error')
     assert.equal(JSON.stringify(h.bridge.getSnapshot()).includes(fictionalSession.token), false)
   } finally { await h.dispose(); t.mock.timers.reset() }
+})
+
+test('selecting another site resets per-site observation, persists the choice, and keeps Harness', async () => {
+  const h = harness('plugins', false, {})
+  try {
+    await h.ready()
+    h.requests[0].resolve({ ok: true, value: authorized() }); await flush()
+    h.bridge.selectMode('chat'); await flush()
+    const generation = h.bridge.getSnapshot().authorizationGeneration
+    h.bridge.reportWebsiteNavigation(generation, readyNavigation)
+    assert.equal(h.bridge.getSnapshot().site, 'deepseek')
+    h.bridge.selectSite('claude'); await flush()
+    assert.equal(h.bridge.getSnapshot().site, 'claude')
+    assert.equal(h.storedSites.at(-1), 'claude')
+    assert.deepEqual(h.writes, [])
+    // Every DeepSeek-only observation is reset for the new document.
+    assert.equal(h.bridge.getSnapshot().websiteNavigation.status, 'loading')
+    assert.equal(h.bridge.getSnapshot().websiteNavigation.authenticated, false)
+    assert.equal(h.bridge.getSnapshot().webLoading, true)
+    assert.equal(h.bridge.getSnapshot().websiteSessionStatus, 'idle')
+    assert.equal(h.bridge.getSnapshot().mode, 'chat')
+    // The surface gates its own polls by the selected site, so the previous
+    // document cannot republish; only a fresh document reports again.
+    // Re-selecting the current site or an unknown id changes nothing.
+    const writes = h.writes.length
+    h.bridge.selectSite('claude')
+    h.bridge.selectSite('not-a-site')
+    assert.equal(h.writes.length, writes)
+    assert.equal(h.bridge.getSnapshot().site, 'claude')
+  } finally { await h.dispose() }
 })

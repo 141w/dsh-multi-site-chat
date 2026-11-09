@@ -1,166 +1,91 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { AuthorizationAuthority } from '../src/authorization.js'
-import type { AccountReader } from '../src/authorization.js'
+import { AuthorizationAuthority, PROFILE_CONTEXT_UNAVAILABLE, WEBSITE_PROFILE_PREFIX } from '../src/authorization.js'
+import type { AuthorizationState } from '../src/protocol.js'
 import { DSH_CHAT_DESCRIPTORS, authorizationSchema, clientMetadataSchema, websiteSessionSchema } from '../src/protocol.js'
 
+// The Host authority is profile-scoped and account-free since the 2026-10-11
+// product decision: DSH sign-out never disables CHAT, and the website login is
+// a separate Client state. These tests pin that contract.
 const metadata = { version: '0.2.0-rc.2', locale: 'zh-CN', timezoneOffsetSeconds: 28_800 }
-type Profile = Awaited<ReturnType<AccountReader['getProfile']>>
-function deferred<T>() {
-  let resolve!: (value: T) => void
-  const promise = new Promise<T>(done => { resolve = done })
-  return { promise, resolve }
-}
-class AccountFixture implements AccountReader {
-  status: 'signed-out' | 'credential-stored' = 'credential-stored'
-  profile: Profile = { status: 'ready', value: { id: 'account-a' } }
-  getState = async () => ({ status: this.status })
-  getProfile = async (_metadata: typeof metadata): Promise<Profile> => this.profile
-  async *watch(signal: AbortSignal) {
-    yield { status: this.status }
-    if (!signal.aborted) await new Promise<void>(resolve => { signal.addEventListener('abort', () => { resolve() }, { once: true }) })
-  }
-}
-function authority(account = new AccountFixture()) {
+
+test('a trusted profile scope authorizes immediately with its derived account and no error', () => {
   let epoch = 0
-  return { account, auth: new AuthorizationAuthority(account, () => `epoch-${++epoch}`) }
-}
-
-test('stored credentials alone never enable CHAT; a ready stable profile enables it', async t => {
-  const { account, auth } = authority()
-  t.after(() => { auth.dispose() })
-  assert.equal(auth.getSnapshot().status, 'pending')
-  account.profile = { status: 'failed' }
-  const unconfirmed = await auth.refresh(metadata)
-  assert.equal(unconfirmed.status, 'unavailable')
-  assert.equal(unconfirmed.accountId, null)
-  account.profile = { status: 'ready', value: { id: null } }
-  assert.equal((await auth.refresh(metadata)).status, 'unavailable')
-  account.profile = { status: 'ready', value: { id: 'account-a' } }
-  const confirmed = await auth.refresh(metadata)
-  assert.equal(confirmed.status, 'authorized')
-  assert.equal(confirmed.accountId, 'account-a')
-  assert.equal(confirmed.error, null)
+  const auth = new AuthorizationAuthority(`${WEBSITE_PROFILE_PREFIX}scope-a`, () => `epoch-${++epoch}`)
+  const snapshot = auth.getSnapshot()
+  assert.equal(snapshot.status, 'authorized')
+  assert.equal(snapshot.accountId, `${WEBSITE_PROFILE_PREFIX}scope-a`)
+  assert.equal(snapshot.epoch, 'epoch-1')
+  assert.equal(snapshot.error, null)
 })
 
-test('same-account refresh and ordinary network failure preserve its authorized generation', async t => {
-  const { account, auth } = authority()
-  t.after(() => { auth.dispose() })
-  const initial = await auth.refresh(metadata)
-  assert.deepEqual(await auth.refresh(metadata), initial)
-  account.getProfile = async () => { throw new Error('fixture offline') }
-  const failed = await auth.refresh(metadata)
-  assert.equal(failed.status, 'authorized')
-  assert.equal(failed.accountId, initial.accountId)
-  assert.equal(failed.epoch, initial.epoch)
-  assert.equal(failed.error, 'account-profile-unavailable')
-  account.getProfile = async () => account.profile
-  assert.deepEqual(await auth.refresh(metadata), initial)
+test('a missing profile context stays authorized on a volatile account and reports the limitation', () => {
+  let epoch = 0
+  const auth = new AuthorizationAuthority(null, () => `epoch-${++epoch}`)
+  const snapshot = auth.getSnapshot()
+  assert.equal(snapshot.status, 'authorized')
+  assert.ok(snapshot.accountId?.startsWith('chat-volatile:'))
+  assert.equal(snapshot.error, PROFILE_CONTEXT_UNAVAILABLE)
+  const other = new AuthorizationAuthority(null, () => 'epoch-x')
+  assert.notEqual(other.getSnapshot().accountId, snapshot.accountId)
+  assert.notEqual(other.getSnapshot().epoch, snapshot.epoch)
 })
 
-test('confirmed sign-out publishes immediately and fences a delayed valid profile', async t => {
-  const { account, auth } = authority()
-  t.after(() => { auth.dispose() })
-  const initial = await auth.refresh(metadata)
-  const started = deferred<void>()
-  const delayed = deferred<Profile>()
-  account.getProfile = async () => { started.resolve(); return delayed.promise }
-  const refreshing = auth.refresh(metadata)
-  await started.promise
-  let notification = auth.getSnapshot()
-  const unsubscribe = auth.subscribe(() => { notification = auth.getSnapshot() })
-  account.status = 'signed-out'
-  auth.invalidate()
-  assert.equal(notification.status, 'unauthorized')
-  assert.equal(notification.accountId, null)
-  assert.notEqual(notification.epoch, initial.epoch)
-  delayed.resolve({ status: 'ready', value: { id: 'account-a' } })
-  assert.equal((await refreshing).status, 'unauthorized')
-  assert.equal(auth.getSnapshot().status, 'unauthorized')
-  unsubscribe()
+test('refresh resolves a detached snapshot copy and keeps serving until disposal', async () => {
+  const auth = new AuthorizationAuthority(`${WEBSITE_PROFILE_PREFIX}scope-a`, () => 'epoch-1')
+  const first = await auth.refresh(metadata)
+  assert.deepEqual(first, auth.getSnapshot())
+  assert.notStrictEqual(first, auth.getSnapshot())
+  auth.dispose()
+  await assert.rejects(() => auth.refresh(metadata), /disposed/)
 })
 
-test('grant replacement closes the gate, changes epoch, and discards the old account response', async t => {
-  const { account, auth } = authority()
-  t.after(() => { auth.dispose() })
-  const initial = await auth.refresh(metadata)
-  const started = deferred<void>()
-  const oldProfile = deferred<Profile>()
-  account.getProfile = async () => { started.resolve(); return oldProfile.promise }
-  const oldRefresh = auth.refresh(metadata)
-  await started.promise
-  account.profile = { status: 'ready', value: { id: 'account-b' } }
-  account.getProfile = async () => account.profile
-  auth.grantChanged()
-  const pending = auth.getSnapshot()
-  assert.equal(pending.status, 'pending')
-  assert.equal(pending.accountId, null)
-  assert.notEqual(pending.epoch, initial.epoch)
-  const replacement = await auth.refresh(metadata)
-  assert.equal(replacement.status, 'authorized')
-  assert.equal(replacement.accountId, 'account-b')
-  assert.notEqual(replacement.epoch, initial.epoch)
-  oldProfile.resolve({ status: 'ready', value: { id: 'account-a' } })
-  await oldRefresh
-  assert.deepEqual(auth.getSnapshot(), replacement)
-})
-
-test('same account reauthorization receives a new epoch while ordinary refresh does not', async t => {
-  const { auth } = authority()
-  t.after(() => { auth.dispose() })
-  const initial = await auth.refresh(metadata)
-  auth.grantChanged()
-  const renewed = await auth.refresh(metadata)
-  assert.equal(renewed.accountId, initial.accountId)
-  assert.notEqual(renewed.epoch, initial.epoch)
-  assert.deepEqual(await auth.refresh(metadata), renewed)
-})
-
-test('a safe state read completed before sign-out cannot reenable authorization afterward', async t => {
-  const { account, auth } = authority()
-  t.after(() => { auth.dispose() })
-  await auth.refresh(metadata)
-  const started = deferred<void>()
-  const delayed = deferred<{ status: 'credential-stored' }>()
-  account.getState = async () => { started.resolve(); return delayed.promise }
-  const refresh = auth.refresh(metadata)
-  await started.promise
-  auth.invalidate()
-  delayed.resolve({ status: 'credential-stored' })
-  await refresh
-  assert.equal(auth.getSnapshot().status, 'unauthorized')
-})
-
-test('authorization stream starts closed, publishes confirmation and logout, then aborts cleanly', async t => {
-  const { account, auth } = authority()
-  t.after(() => { auth.dispose() })
-  const delayed = deferred<Profile>()
-  account.getProfile = async () => delayed.promise
+test('the stream yields the current state and ends when the authority is disposed or aborted', async () => {
+  const auth = new AuthorizationAuthority(`${WEBSITE_PROFILE_PREFIX}scope-a`, () => 'epoch-1')
   const controller = new AbortController()
   const iterator = auth.watch(metadata, controller.signal)[Symbol.asyncIterator]()
   const first = await iterator.next()
   assert.equal(first.done, false)
-  assert.equal(first.value?.status, 'pending')
-  const waiting = iterator.next()
-  delayed.resolve({ status: 'ready', value: { id: 'account-a' } })
-  assert.equal((await waiting).value?.status, 'authorized')
-  auth.invalidate()
-  assert.equal((await iterator.next()).value?.status, 'unauthorized')
-  const end = iterator.next()
-  controller.abort()
-  assert.equal((await end).done, true)
+  assert.equal(first.value?.status, 'authorized')
+  auth.dispose()
+  assert.equal((await iterator.next()).done, true)
+  const aborted = new AuthorizationAuthority(`${WEBSITE_PROFILE_PREFIX}scope-b`, () => 'epoch-1')
+  const stop = new AbortController()
+  const live = aborted.watch(metadata, stop.signal)[Symbol.asyncIterator]()
+  assert.equal((await live.next()).value?.status, 'authorized')
+  stop.abort()
+  assert.equal((await live.next()).done, true)
+})
+
+test('disposal publishes unauthorized with a fresh epoch, clears listeners, and is idempotent', () => {
+  let epoch = 0
+  const auth = new AuthorizationAuthority(`${WEBSITE_PROFILE_PREFIX}scope-a`, () => `epoch-${++epoch}`)
+  const seen: AuthorizationState[] = []
+  const unsubscribe = auth.subscribe(() => { seen.push(auth.getSnapshot()) })
+  auth.dispose()
+  assert.deepEqual(seen.map(item => item.status), ['unauthorized'])
+  assert.equal(seen[0].epoch, 'epoch-2')
+  assert.equal(seen[0].accountId, null)
+  assert.equal(seen[0].error, null)
+  assert.equal(auth.getSnapshot().status, 'unauthorized')
+  unsubscribe()
+  auth.dispose()
+  assert.equal(seen.length, 1)
 })
 
 test('public descriptors keep authorization credential-free and strictly declare the separate website session seam', () => {
   assert.deepEqual(DSH_CHAT_DESCRIPTORS.map(item => item.method), [
     'authorization', 'watchAuthorization', 'loadWebsiteSession', 'saveWebsiteSession', 'clearWebsiteSession',
+    'saveSiteSession', 'loadSiteSession', 'clearSiteSession',
   ])
   for (const descriptor of DSH_CHAT_DESCRIPTORS) {
     assert.ok(descriptor.parameters.every(parameter => parameter.codec.mode === 'strict'))
     assert.equal(descriptor.result?.mode, 'strict')
     assert.deepEqual(descriptor.cancellation, { parameter: 'signal' })
     const expected = descriptor.method === 'saveWebsiteSession' ? ['metadata', 'epoch', 'session']
-      : descriptor.method.endsWith('WebsiteSession') ? ['metadata', 'epoch'] : ['metadata']
+      : descriptor.method.endsWith('WebsiteSession') ? ['metadata', 'epoch']
+      : descriptor.method === 'saveSiteSession' ? ['metadata', 'epoch', 'site', 'cookies']
+      : descriptor.method.endsWith('SiteSession') ? ['metadata', 'epoch', 'site'] : ['metadata']
     assert.deepEqual(descriptor.parameters.map(parameter => parameter.name), expected)
   }
   assert.throws(() => clientMetadataSchema.parse({ ...metadata, token: 'fixture-only' }))

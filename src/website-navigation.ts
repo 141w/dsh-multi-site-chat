@@ -540,7 +540,14 @@ export function parseWebsiteNavigation(value: unknown): WebsiteNavigation {
   if (!value || typeof value !== 'object') throw new Error('Invalid navigation response')
   const source = value as WebsiteNavigation
   if (!['loading', 'ready', 'sign-in', 'unsupported'].includes(source.status) || !Array.isArray(source.conversations)) throw new Error('Invalid navigation response')
-  const validHref = (href: unknown): href is string => typeof href === 'string' && /^https:\/\/chat\.deepseek\.com\/a\/chat\/s\/[a-zA-Z0-9-]+$/.test(href)
+  // DeepSeek keeps its exact conversation URL; every other registered site
+  // admits its own conversation path, absolute on its host or root-relative.
+  const validHref = (href: unknown): href is string => typeof href === 'string' && (
+    /^https:\/\/chat\.deepseek\.com\/a\/chat\/s\/[a-zA-Z0-9-]+$/.test(href)
+    || /^https:\/\/(chatgpt\.com|claude\.ai|gemini\.google\.com)\/[^?#]+$/.test(href)
+    || /^\/(c|chat|app)\/[a-zA-Z0-9-]+$/.test(href)
+    // Gemini keeps the account index in the path (/u/1/app/<id>).
+    || /^\/u\/\d+\/(c|chat|app)\/[a-zA-Z0-9-]+$/.test(href))
   const conversations = source.conversations.slice(0, 1000).filter(item => item && validHref(item.href) && typeof item.title === 'string' && typeof item.group === 'string')
     .map(item => ({ href: item.href, title: item.title.slice(0, 300), group: item.group.slice(0, 80) }))
   const authenticated = source.status === 'sign-in' ? false : source.authenticated === true ? true

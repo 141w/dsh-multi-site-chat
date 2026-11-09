@@ -111,8 +111,10 @@ check('only a real sign-in route confirms signed-out and removes drag targets',r
 check('SPA sign-in transitions do not briefly reveal the old website sidebar',getComputedStyle(document.getElementById('sidebar')).display==='none')
 const plaintext=document.createElement('div');plaintext.contentEditable='plaintext-only';plaintext.style.cssText='position:fixed;top:12px;left:24px;width:300px;height:28px';plaintext.textContent='Fictional unsaved title';document.body.append(plaintext)
 check('plaintext-only unsaved editors block refresh without exporting text',websiteRefreshReadiness(document,origin)==='draft')
+check('plaintext-only unsaved editors block refresh without exporting text',websiteRefreshReadiness(document,origin,['chat.deepseek.com'])==='draft')
 plaintext.textContent=''
 check('empty plaintext-only editors do not block a safe refresh',websiteRefreshReadiness(document,origin)==='ready')
+check('empty plaintext-only editors do not block a safe refresh',websiteRefreshReadiness(document,origin,['chat.deepseek.com'])==='ready')
 plaintext.remove()
 fixture();step();document.querySelector('._2be88ba').remove()
 check('new-chat empty header geometry remains usable without a mirrored title',Boolean(readWebsiteWindowDragGeometry(document,origin)?.regions.length))
@@ -156,7 +158,8 @@ const surfaceBridge=new Proxy({
  reportWebsiteNavigation(generation,value){if(generation===surfaceState.authorizationGeneration)patchSurface({websiteNavigation:parseWebsiteNavigation(value)})},
  loadWebsiteSession:async()=>null,
 },{get(target,key){return key in target?target[key]:(...args)=>{surfaceCalls.push(String(key))}}})
-const nativeFixture={acquire:async()=>{acquired++;return{lease:'fixture-lease',partition:'fixture-partition'}},release:async()=>{released++},onOpenRequested:()=>()=>{}}
+let openRequestListeners=[]
+const nativeFixture={acquire:async()=>{acquired++;return{lease:'fixture-lease',partition:'fixture-partition'}},release:async()=>{released++},onOpenRequested:(_lease,listener)=>{openRequestListeners.push(listener);return()=>{openRequestListeners=openRequestListeners.filter(entry=>entry!==listener)}}}
 // Fictional native main-content clipping container. The actual main slot measures it.
 const nativeFrame=document.createElement('div')
 nativeFrame.style.cssText='position:fixed;left:0;top:0;width:100%;height:100%;overflow:hidden;border-radius:0px'
@@ -364,6 +367,50 @@ check('re-entering CHAT uses a fresh signal and creates only one verified row',r
 nextController.abort();patchSurface({mode:'harness'});await settle()
 check('a second CHAT to HARNESS transition leaves zero native markers or hole nodes',rowMarkers().length===0 && dragNodes().length===0)
 check('abort and mode cleanup never modify another host-owned drag element',hostSentinel.getAttribute('data-window-drag')==='fixture-host-owned' && hostSentinel.style.display==='block')
+// Multi-site switching: the retained guest navigates to the selected landing
+// URL; its lease, partition and element survive, and switching back restores it.
+let guestUrl=`${origin}/a/chat/s/fixture-id`
+const loadedUrls=[]
+retainedGuest.getURL=()=>guestUrl
+retainedGuest.loadURL=async url=>{loadedUrls.push(url);guestUrl=url}
+patchSurface({mode:'chat',site:'chatgpt'})
+await until(()=>loadedUrls.includes('https://chatgpt.com/'))
+retainedGuest.dispatchEvent(new Event('did-stop-loading'))
+await until(()=>!surface.querySelector('.dsh-chat-web-status'))
+check('selecting another site navigates the retained guest without a new lease',loadedUrls.includes('https://chatgpt.com/') && surface.querySelector('webview')===retainedGuest && acquired===1 && released===0)
+check('a native site presents its own document without the DeepSeek placeholder',!surface.querySelector('.dsh-chat-web-status') && retainedGuest.style.opacity==='1' && !retainedGuest.inert)
+patchSurface({site:'deepseek'})
+await until(()=>guestUrl==='https://chat.deepseek.com/')
+check('switching back returns the same guest to the DeepSeek landing URL',guestUrl==='https://chat.deepseek.com/' && surface.querySelector('webview')===retainedGuest && acquired===1)
+// A denied window.open (a sign-in popup) must navigate the same guest and run
+// to its end: the selected-site self-heal stays away while the flow is off-site.
+patchSurface({site:'chatgpt'})
+await until(()=>guestUrl==='https://chatgpt.com/')
+retainedGuest.dispatchEvent(new Event('did-stop-loading'))
+await until(()=>!surface.querySelector('.dsh-chat-web-status'))
+const externalUrl='https://auth.openai.com/log-in'
+openRequestListeners.forEach(listener=>listener(externalUrl))
+await until(()=>guestUrl===externalUrl)
+retainedGuest.dispatchEvent(new Event('did-stop-loading'))
+await settle()
+check('a denied window.open navigates the same guest instead of being dropped',loadedUrls.includes(externalUrl) && surface.querySelector('webview')===retainedGuest && acquired===1 && released===0)
+check('an external sign-in flow is never pulled back by the site self-heal',guestUrl===externalUrl && !surface.querySelector('.dsh-chat-web-status') && retainedGuest.style.opacity==='1')
+// Every redirect in the chain is a new main document: the presentation resets
+// and must be re-established for the flow's own page, not left concealed.
+const mainFrameNavigation = () => { const event = new Event('did-start-navigation'); Object.defineProperty(event, 'isMainFrame', { value: true }); Object.defineProperty(event, 'isInPlace', { value: false }); return event }
+retainedGuest.dispatchEvent(mainFrameNavigation())
+await settle()
+check('a redirect inside the flow keeps the previous document visible',surface.querySelector('.dsh-chat-web-status')===null && retainedGuest.style.opacity==='1')
+guestUrl='https://accounts.google.com/o/oauth2/auth'
+retainedGuest.dispatchEvent(new Event('did-stop-loading'))
+await until(()=>!surface.querySelector('.dsh-chat-web-status'))
+check('each redirect target of the flow is presented as soon as it loads',!surface.querySelector('.dsh-chat-web-status') && retainedGuest.style.opacity==='1' && loadedUrls.includes('https://accounts.google.com/o/oauth2/auth')===false)
+// The remaining force-lock is narrow: only another registered site desyncs the
+// switcher and is healed back; every other host is a legitimate flow.
+guestUrl='https://gemini.google.com/app'
+retainedGuest.dispatchEvent(new Event('did-stop-loading'))
+await until(()=>guestUrl==='https://chatgpt.com/')
+check('a guest left on another registered site is still healed back to the selected site',guestUrl==='https://chatgpt.com/' && loadedUrls.filter(url=>url==='https://chatgpt.com/').length>=2)
 disposeDrag();disposeSurface();await settle()
 check('Surface destruction unbinds exactly its own sampler and releases the fictional guest',sampler===null && samplerBinds===1 && samplerUnbinds===1 && released===1)
 disposePanel();nativeFrame.style.borderRadius='30px';await settle()

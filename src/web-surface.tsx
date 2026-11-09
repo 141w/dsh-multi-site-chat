@@ -10,7 +10,8 @@ import { parseWebsiteSession, websiteSessionCaptureScript, websiteSessionRestore
 import { handleWebsiteLink } from './website-links.js'
 import { parseWebsiteDownload, websiteDownloadScript } from './website-downloads.js'
 import type { WebsiteFile } from './website-downloads.js'
-
+import { CHAT_SITES, allSiteHosts, siteById, siteLabel, urlBelongsToSite } from './sites.js'
+import { siteCookieWriteScript, siteHasConversationList, siteNavigationScript, siteOpenScript } from './site-navigation.js'
 const WEBSITE_URL = 'https://chat.deepseek.com/'
 
 /** Fixed codes only; the page never supplies these strings. */
@@ -26,8 +27,14 @@ function noticeText(notice: WebsiteNotice | null | undefined, t: (text: string) 
 }
 
 /** Runs entirely in our guest. Only an enum crosses back; no draft text is exported or stored. */
-function websiteRefreshReadiness(doc: Document, origin: string): 'ready' | 'draft' | 'busy' | 'unavailable' {
-  if (origin!=='https://chat.deepseek.com') return 'unavailable'
+
+/** Runs entirely in our guest. Only an enum crosses back; no draft text is exported or stored.
+ *  Serialized by toString, so it receives its allowed hosts as a plain argument. */
+function websiteRefreshReadiness(doc: Document, origin: string, hosts?: readonly string[]): 'ready' | 'draft' | 'busy' | 'unavailable' {
+  let host: string
+  try { host = new URL(origin).hostname } catch { return 'unavailable' }
+  // The host list is optional: a caller that passes none gets no origin gate.
+  if (hosts !== undefined && !hosts.includes(host)) return 'unavailable'
   const visible = (node: Element) => {
     const rect=node.getBoundingClientRect()
     const style=doc.defaultView?.getComputedStyle(node)
@@ -95,6 +102,8 @@ export function DshChatWebSurface({ bridge, nativeBrowser }: PropsRuntime<'shell
   const guest = useRef<WebsiteWebview | null>(null)
   const guestEvents = useRef<AbortController | null>(null)
   const retryGuestSession = useRef<(() => void) | null>(null)
+  /** Guest-internal navigation entry, bound while a guest is attached. */
+  const navigateToSite = useRef<((url: string) => void) | null>(null)
   const lastReload = useRef(state.websiteReloadRevision)
 
   useEffect(() => {
@@ -150,6 +159,7 @@ export function DshChatWebSurface({ bridge, nativeBrowser }: PropsRuntime<'shell
     guestEvents.current = events
     guest.current = current
     const generation = reservation.generation
+    bridge.reportSiteGuest?.(generation, reservation.native.partition)
     let bootstrapped = false
     let lastError: string | null = null
     let navigationRevision = 0
@@ -181,7 +191,10 @@ export function DshChatWebSurface({ bridge, nativeBrowser }: PropsRuntime<'shell
     const resetDocumentPresentation = () => {
       documentRevision++
       documentPresented=false
-      setPresentationReady(false)
+      // A new document replaces the old one in place: the guest keeps showing
+      // what it already has until the replacement is ready, so a site switch
+      // never blinds the user with a placeholder over a working page. Only a
+      // guest that never presented anything (or an error) shows the card.
       bridge.reportWebsiteNavigation(generation, emptyNavigation(), true)
     }
     let reading = false
@@ -209,8 +222,32 @@ export function DshChatWebSurface({ bridge, nativeBrowser }: PropsRuntime<'shell
       const snapshot=bridge.getSnapshot()
       return !events.signal.aborted && snapshot.authorizationGeneration===generation && snapshot.authorizationStatus==='authorized'
     }
+    // The plugin-owned login memory serves the DeepSeek site only; other
+    // sites keep their own native cookies inside the shared guest.
     const approvedOrigin = () => {
-      try { return new URL(current.getURL()).origin==='https://chat.deepseek.com' } catch { return false }
+      try { return urlBelongsToSite(current.getURL(), siteById('deepseek')) } catch { return false }
+    }
+    const deepseekSite = () => siteById(bridge.getSnapshot().site, bridge.getSnapshot().customSites ?? []).id === 'deepseek'
+    // Native (non-DeepSeek) sites have no plugin-owned adapter: present the
+    // guest as soon as its own document finished loading on a registered host.
+    let nativePresented = false
+    const presentNativeDocument = () => {
+      // Presentation follows the document, not the selected site: a sign-in
+      // flow legitimately shows external hosts across several redirects, and
+      // concealing them would strand the flow. Only another registered site's
+      // document is left to the switcher's own site navigation, and the
+      // selected site's own DeepSeek document keeps its adapter proof.
+      const site = siteById(bridge.getSnapshot().site, bridge.getSnapshot().customSites ?? [])
+      let url = ''
+      try { url = current.getURL() } catch { return }
+      if (!url.startsWith('https:')) return
+      if (CHAT_SITES.some(other => other.id !== site.id && urlBelongsToSite(url, other))) return
+      if (site.id === 'deepseek' && urlBelongsToSite(url, site)) return
+      // Idempotent: every ready document re-asserts the presentation, so a
+      // late subframe reset can never leave a loaded page concealed.
+      nativePresented = true
+      setPresentationReady(true)
+      bridge.reportWebsiteNavigation(generation, { status: 'unsupported', conversations: [], selectedHref: null, canCreate: true, error: null })
     }
     const prepareSession = async (): Promise<boolean> => {
       if(restorationAttempted) return true
@@ -280,6 +317,36 @@ export function DshChatWebSurface({ bridge, nativeBrowser }: PropsRuntime<'shell
       const requestAuthenticationRevision=snapshot.websiteAuthenticationRevision
       const currentDocument=()=>active() && requestDocumentRevision===documentRevision
       const currentProjection=()=>currentDocument() && bridge.getSnapshot().websiteAuthenticationRevision===requestAuthenticationRevision
+      // An external-flow document is presented directly; the selected site's
+      // own document continues to its adapter (DeepSeek) or native proof.
+      presentNativeDocument()
+      // A registered native site's own conversation list feeds the sidebar,
+      // exactly like the DeepSeek adapter does for its site.
+      if (siteById(snapshot.site, bridge.getSnapshot().customSites ?? []).id !== 'deepseek' && siteHasConversationList(snapshot.site)) {
+        const siteNavigation = await executeScript(siteNavigationScript(snapshot.site))
+          .then(raw => parseWebsiteNavigation(raw)).catch(() => null)
+        if (siteNavigation !== null && currentProjection()) {
+        const signedIn = siteNavigation.authenticated === true
+        bridge.reportWebsiteNavigation(generation, siteNavigation)
+        // One source of truth: the same signal that renders the sidebar list
+        // also drives the settings badge. Reading document.cookie cannot work
+        // here, because these sites keep their login token httpOnly.
+        bridge.probeSiteLogins({ [snapshot.site]: signedIn })
+        // The guest is now on this site’s own origin and reports signed out:
+        // write the remembered login, then reload so the server sees it.
+        if (!signedIn && pendingRestoreSite.current === snapshot.site && typeof bridge.loadSiteSession === 'function') {
+          pendingRestoreSite.current = null
+          void (async () => {
+            const loaded = await Promise.resolve(bridge.loadSiteSession(generation, snapshot.site)).catch(() => null)
+            const stored = loaded !== null && loaded !== undefined && Array.isArray(loaded.cookies) ? loaded : null
+            if (events.signal.aborted || stored === null || stored.cookies.length === 0) return
+            await current.executeJavaScript(siteCookieWriteScript(stored.cookies)).catch(() => false)
+            if (!events.signal.aborted) current.reload()
+          })()
+        }
+      }
+        return
+      }
       if(command.type==='snapshot') command={...command,headerInset:headerInset(snapshot.viewport)}
       if (events.signal.aborted || snapshot.authorizationGeneration !== generation || snapshot.authorizationStatus !== 'authorized') return
       if (snapshot.websiteAuthenticationStatus==='signing-out' && command.type!=='logout' && command.type!=='snapshot') return
@@ -325,6 +392,21 @@ export function DshChatWebSurface({ bridge, nativeBrowser }: PropsRuntime<'shell
     const snapshotCommand = (): WebsiteCommand => {const snapshot=bridge.getSnapshot();return {type:'snapshot',showOriginal:snapshot.showWebsiteNavigation, headerInset:headerInset(snapshot.viewport)}}
     const syncNavigation = () => {
       if (reading || events.signal.aborted) return
+      // The selected site is authoritative only against another registered site
+      // or a blank guest: that state desynchronises the switcher and is healed
+      // back, which also covers a switch requested before the guest attached.
+      // Any other host is a legitimate flow (a sign-in redirect chain) and is
+      // never pulled back, or the login could not complete.
+      try {
+        const site = siteById(bridge.getSnapshot().site, bridge.getSnapshot().customSites ?? [])
+        const url = current.getURL()
+        if (!urlBelongsToSite(url, site)) {
+          const wrongSite = url.startsWith('about:blank') || CHAT_SITES.some(other => other.id !== site.id && urlBelongsToSite(url, other))
+          if (!wrongSite) return
+          if (pendingNavigationUrl !== site.url) { bootstrapped = true; navigate(site.url) }
+          return
+        }
+      } catch { return }
       lastPolled=Date.now();reading = true
       queued = queued.then(() => adapt(snapshotCommand())).finally(() => { reading = false })
     }
@@ -341,15 +423,29 @@ export function DshChatWebSurface({ bridge, nativeBrowser }: PropsRuntime<'shell
     events.signal.addEventListener('abort', () => themeObserver.disconnect(), { once: true })
     const stopCommands = bridge.bindWebsiteNavigation(generation, command => {
       if(command.type!=='snapshot') fastPollingUntil=Date.now()+8000
+      // A native site's own sidebar link keeps its SPA state; its landing URL
+      // is the new-conversation target.
+      if ((command.type === 'open' || command.type === 'new') && siteById(bridge.getSnapshot().site, bridge.getSnapshot().customSites ?? []).id !== 'deepseek') {
+        const site = siteById(bridge.getSnapshot().site, bridge.getSnapshot().customSites ?? [])
+        queued = queued.then(async () => {
+          // Navigate the guest directly. Clicking the site's own anchor through
+          // executeJavaScript can hang forever when the site's router replaces
+          // the document, which stalls the command behind its 8s deadline.
+          if (command.type === 'new') { navigate(site.url); return }
+          navigate(new URL(current.getURL()).origin + command.href)
+        })
+        return queued
+      }
       if (command.type==='refresh') {
         queued=queued.then(async()=>{
           clearTimeout(navigationRefreshTimer);navigationRefreshTimer=undefined
           const refreshRequest={requestId:command.requestId,authenticationRevision:command.authenticationRevision,documentRevision}
           navigationRefresh=refreshRequest
           const sameRequest=()=>navigationRefresh===refreshRequest && active() && bridge.getSnapshot().websiteAuthenticationRevision===command.authenticationRevision
-          if (!sameRequest() || !approvedOrigin()) {finishNavigationRefresh('官网页面状态已变化，请稍后重试刷新。',refreshRequest);return}
+          if (!sameRequest() || !approvedOrigin()
+            || !urlBelongsToSite(current.getURL(), siteById(bridge.getSnapshot().site, bridge.getSnapshot().customSites ?? []))) {finishNavigationRefresh('官网页面状态已变化，请稍后重试刷新。',refreshRequest);return}
           try {
-            const readiness=await executeScript(`(${websiteRefreshReadiness.toString()})(document,location.origin)`)
+            const readiness=await executeScript(`(${websiteRefreshReadiness.toString()})(document,location.origin,${JSON.stringify(allSiteHosts(bridge.getSnapshot().customSites ?? []))})`)
             if (!sameRequest() || documentRevision!==refreshRequest.documentRevision) {finishNavigationRefresh('官网页面状态已变化，请稍后刷新。',refreshRequest);return}
             if (readiness!=='ready') {
               finishNavigationRefresh(readiness==='draft' ? '请先发送或清空未发送内容，再刷新对话列表。'
@@ -378,17 +474,33 @@ export function DshChatWebSurface({ bridge, nativeBrowser }: PropsRuntime<'shell
     })
     const timer = setInterval(()=>{if(Date.now()-lastPolled>=(Date.now()<fastPollingUntil ? 200 : 1200)) syncNavigation()},200)
     events.signal.addEventListener('abort', () => { clearInterval(timer); finishNavigationRefresh('网页已关闭，刷新未完成。'); stopCommands() }, { once: true })
+    let pendingNavigationUrl: string | null = null
     const navigate = (url: string) => {
       const revision = ++navigationRevision
+      pendingNavigationUrl = url
       report(true)
       void current.loadURL(url).catch((error: unknown) => {
         if (revision !== navigationRevision || events.signal.aborted) return
         if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ERR_ABORTED') return
-        report(false, 'DeepSeek 网页加载失败。请检查网络后重试。')
+        report(false, '网页加载失败。请检查网络后重试。')
       })
     }
+    navigateToSite.current = navigate
+    events.signal.addEventListener('abort', () => { if (navigateToSite.current === navigate) navigateToSite.current = null }, { once: true })
     current.addEventListener('dom-ready', () => {
-      if (!bootstrapped) { bootstrapped = true; navigate(WEBSITE_URL) }
+      if (!bootstrapped) {
+        bootstrapped = true
+        const site = siteById(bridge.getSnapshot().site, bridge.getSnapshot().customSites ?? [])
+        // Same restore gate as a site switch: the remembered login lands before
+        // the first document of this guest.
+        if (site.id !== 'deepseek' && typeof bridge.loadSiteSession === 'function') pendingRestoreSite.current = site.id
+        navigate(site.url)
+      }
+      else if (nativePresented) {
+        // dom-ready also fires for subframe documents; an already presented
+        // native page must not be cleared by an iframe loading beside it.
+        syncNavigation()
+      }
       else { resetDocumentPresentation(); syncNavigation() }
     }, { signal: events.signal })
     current.addEventListener('did-start-navigation', event => {
@@ -396,17 +508,23 @@ export function DshChatWebSurface({ bridge, nativeBrowser }: PropsRuntime<'shell
       // Only a new main document loses its adapter/preference markers. Loading
       // activity in other frames must not hide or clear an already ready page.
       if (navigation.isMainFrame !== true || navigation.isInPlace !== false) return
+      nativePresented = false
       resetDocumentPresentation(); report(true)
     }, { signal: events.signal })
     current.addEventListener('did-start-loading', () => { report(true) }, { signal: events.signal })
     current.addEventListener('did-navigate-in-page', event => {
       if ((event as Event & { readonly isMainFrame?: boolean }).isMainFrame !== true) return
-      fastPollingUntil=Date.now()+8000;syncNavigation()
+      fastPollingUntil=Date.now()+8000;presentNativeDocument();syncNavigation()
     }, { signal: events.signal })
-    current.addEventListener('did-stop-loading', () => { report(false); syncNavigation() }, { signal: events.signal })
+    current.addEventListener('did-stop-loading', () => {
+      pendingNavigationUrl = null; report(false); presentNativeDocument(); syncNavigation()
+      const site = siteById(bridge.getSnapshot().site, bridge.getSnapshot().customSites ?? [])
+
+
+    }, { signal: events.signal })
     current.addEventListener('did-fail-load', event => {
       const failure = event as Event & { readonly isMainFrame?: boolean; readonly errorCode?: number }
-      if (failure.isMainFrame === true && failure.errorCode !== -3) report(false, 'DeepSeek 网页加载失败。请检查网络后重试。')
+      if (failure.isMainFrame === true && failure.errorCode !== -3) report(false, '网页加载失败。请检查网络后重试。')
     }, { signal: events.signal })
     current.addEventListener('render-process-gone', () => {
       needsRecovery.current = true
@@ -415,11 +533,14 @@ export function DshChatWebSurface({ bridge, nativeBrowser }: PropsRuntime<'shell
     }, { signal: events.signal })
     const offOpen = nativeBrowser.onOpenRequested(reservation.native.lease, url => {
       if (events.signal.aborted) return
-      const route = handleWebsiteLink(url, (target, name, features) => window.open(target, name, features))
-      if (route.kind === 'same-site') { navigate(route.url); return }
-      // External pages go to the system browser: the right-Sidebar browser belongs to
-      // HARNESS and would change this view. A failed dispatch is never a page-load error.
-      if (route.kind === 'failed' || route.kind === 'rejected') bridge.reportWebsiteNotice(generation, 'link-unavailable')
+      let target: URL
+      try { target = new URL(url) } catch { return }
+      // The provider already admits only http(s) targets outside this app, and
+      // credentials inside a URL are never followed. Sign-in and OAuth flows
+      // leave the selected site by design: following them in the one guest is
+      // what keeps those redirect chains alive, so the selected-site self-heal
+      // stays away until the flow returns home.
+      if (target.protocol === 'https:' && target.username === '' && target.password === '') navigate(target.href)
     })
     events.signal.addEventListener('abort', offOpen, { once: true })
     // Generated attachments: the guest's own blob is read on the user's explicit export
@@ -461,13 +582,33 @@ export function DshChatWebSurface({ bridge, nativeBrowser }: PropsRuntime<'shell
     retryGuestSession.current?.()
     try {
       if (current.getURL().startsWith('about:blank')) {
-        void current.loadURL(WEBSITE_URL).catch(() => bridge.reportWebsiteState(reservation.generation, { loading: false, error: 'DeepSeek 网页加载失败。' }))
+        void current.loadURL(siteById(state.site, bridge.getSnapshot().customSites ?? []).url).catch(() => bridge.reportWebsiteState(reservation.generation, { loading: false, error: '网页加载失败。' }))
       } else current.reload()
     } catch {
       needsRecovery.current = true
       bridge.reportWebsiteState(reservation.generation, { loading: false, error: '无法刷新当前网页，请点击「重试网页」。' })
     }
   }, [bridge, nativeBrowser, reservation, state.websiteReloadRevision, state.modeEnabled, state.authorizationStatus])
+
+  // A site switch navigates the retained guest to the new landing URL. The
+  // client already reset every per-site observation before bumping this state.
+  // The ref is consumed only once the navigation is actually issued, so a
+  // switch requested before the guest attached is retried when it does; the
+  // polling self-heal covers any other missed attempt.
+  /** Site whose remembered login waits for its first document to land. */
+  const pendingRestoreSite = useRef<string | null>(null)
+  const lastSite = useRef(state.site)
+  useEffect(() => {
+    if (lastSite.current === state.site) return
+    const navigate = navigateToSite.current
+    if (navigate === null || reservation === null || needsRecovery.current) return
+    lastSite.current = state.site
+    const site = siteById(state.site, bridge.getSnapshot().customSites ?? [])
+    // A cookie can only be written from its own origin, so the remembered
+    // login is applied after the guest lands on the site, then reloaded.
+    if (site.id !== 'deepseek' && typeof bridge.loadSiteSession === 'function') pendingRestoreSite.current = site.id
+    navigate(site.url)
+  }, [bridge, nativeBrowser, reservation, state.site])
 
   useEffect(() => {
     if((state.mode==='chat' || state.settingsOpen) && state.authorizationStatus==='authorized') bridge.commandWebsite({type:'snapshot',showOriginal:state.showWebsiteNavigation,headerInset:headerInset(state.viewport)})
@@ -488,11 +629,17 @@ export function DshChatWebSurface({ bridge, nativeBrowser }: PropsRuntime<'shell
   const clearance = 0
   const borderRadius = rect?.borderRadius ?? '0px'
   const logoutError=state.websiteAuthenticationStatus==='error' && /退出/.test(state.websiteSessionError ?? '')
-  const projectionError=state.websiteNavigation.status==='unsupported' && state.websiteNavigation.layoutReady!==true ? state.websiteNavigation.error || '暂未识别官网界面，请稍后重新识别。' : null
+  const currentSite = siteById(state.site, bridge.getSnapshot().customSites ?? [])
+  const nativeSite = currentSite.id !== 'deepseek'
+  // The unsupported-list projection proof is DeepSeek-only; native sites present
+  // their own document without any plugin-owned layout recognition.
+  const projectionError=!nativeSite && state.websiteNavigation.status==='unsupported' && state.websiteNavigation.layoutReady!==true ? state.websiteNavigation.error || '暂未识别官网界面，请稍后重新识别。' : null
   const guestUsable=presentationReady && !projectionError && state.websiteAuthenticationStatus!=='signed-out' && state.websiteAuthenticationStatus!=='signing-out' && !logoutError
   const websiteStatusMessage=state.webError || (logoutError ? state.websiteSessionError : projectionError)
-    || (nativeBrowser===undefined ? '需要提供官方浏览器能力的 DSH 桌面版。' : state.websiteAuthenticationStatus==='signing-out' ? '正在清除登录记忆并退出官网。' : 'CHAT 使用独立的官网登录，登录后自动同步账号和官网对话。')
-  return createPortal(<section id="dsh-chat-website-surface" className="dsh-chat-web-surface" aria-label={t("DeepSeek 官网网页")} aria-hidden={!visible || rect?.inert} {...(rect?.inert ? { inert: '' } : {})} style={{
+    || (nativeBrowser===undefined ? '需要提供官方浏览器能力的 DSH 桌面版。' : state.websiteAuthenticationStatus==='signing-out' ? '正在清除登录记忆并退出官网。'
+      : nativeSite ? '该网站以原生网页使用，登录、对话和历史由网页提供。' : 'CHAT 使用独立的官网登录，登录后自动同步账号和官网对话。')
+  const siteText = (key: string) => t(key).replace('{site}', siteLabel(currentSite.id))
+  return createPortal(<section id="dsh-chat-website-surface" className="dsh-chat-web-surface" aria-label={siteText('{site} 官网网页')} aria-hidden={!visible || rect?.inert} {...(rect?.inert ? { inert: '' } : {})} style={{
     zIndex: inSettings ? 0 : 14,
     visibility: visible ? 'visible' : 'hidden',
     display: (inSettings || state.mode==='chat') && rect ? 'flex' : 'none',
@@ -522,10 +669,10 @@ export function DshChatWebSurface({ bridge, nativeBrowser }: PropsRuntime<'shell
         src: `about:blank#${activeReservation.native.lease}`,
         allowpopups: '',
         'data-sidebar-browser-frame': 'webview',
-        'aria-label': t('DeepSeek 官网，登录、聊天和历史由网页提供'),
+        'aria-label': siteText('{site} 官网，登录、聊天和历史由网页提供'),
       })}
       {(nativeBrowser === undefined || state.webError !== null || activeReservation === null || !presentationReady || projectionError || state.websiteAuthenticationStatus==='signed-out' || state.websiteAuthenticationStatus==='signing-out' || logoutError) && <div className={`dsh-chat-web-status${state.webError !== null || projectionError ? ' dsh-chat-web-status-error' : ''}`} role={state.webError !== null || projectionError ? 'alert' : 'status'}>
-        <strong>{t(nativeBrowser === undefined ? '当前环境无法内嵌网页' : state.webError !== null ? '网页暂时无法使用' : logoutError ? '退出登录未完成' : projectionError ? 'CHAT 界面识别失败' : state.websiteAuthenticationStatus==='signed-out' ? '登录 DeepSeek Chat' : state.websiteAuthenticationStatus==='signing-out' ? '正在退出登录' : '正在打开 DeepSeek 官网')}</strong>
+        <strong>{t(nativeBrowser === undefined ? '当前环境无法内嵌网页' : state.webError !== null ? '网页暂时无法使用' : logoutError ? '退出登录未完成' : projectionError ? 'CHAT 界面识别失败' : state.websiteAuthenticationStatus==='signed-out' ? '登录 DeepSeek Chat' : state.websiteAuthenticationStatus==='signing-out' ? '正在退出登录' : siteText('正在打开 {site} 官网'))}</strong>
         <p>{t(websiteStatusMessage)}</p>
         {projectionError && !logoutError && !state.webError && <button type="button" className="dsh-chat-text-button" onClick={()=>bridge.commandWebsite({type:'snapshot',showOriginal:false})} disabled={!state.modeEnabled}>{t("重新识别")}</button>}
         {logoutError && <button type="button" className="dsh-chat-text-button" onClick={()=>bridge.logoutWebsite()}>{t("重试退出登录")}</button>}

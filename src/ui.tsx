@@ -14,9 +14,14 @@ import { DshChatBrandNotice } from './brand-notice.js'
 import type { WebsiteFile } from './website-downloads.js'
 import type { WebsiteCommand, WebsiteNavigation } from './website-navigation.js'
 import type { ChatLanguage } from './website-settings.js'
-import type { WebsiteSession } from './protocol.js'
 import type { WindowDragRegion } from './window-drag.js'
 import { DEFAULT_SWITCH_PREFERENCES, SWITCH_LABEL_LIMIT, switchLabelWidth, validSwitchLabel, type SwitchPreferences } from './preferences.js'
+import type { SiteSession, WebsiteSession } from './protocol.js'
+import { allSites as allSitesOf, siteById, siteInitialLetter, siteLabel, type ChatSite } from './sites.js'
+import { ChatGptLogo, ClaudeLogo, DeepseekLogo, GeminiLogo } from './site-logos.js'
+
+/** Sites whose login memory the plugin owns; DeepSeek keeps its own account card. */
+const SITE_LOGIN_IDS: readonly string[] = ['chatgpt', 'claude', 'gemini']
 
 export type DshChatMode = 'chat' | 'harness'
 
@@ -58,6 +63,14 @@ export interface DshChatViewState {
   readonly websiteNavigationRefreshing: boolean
   readonly websiteNavigationRefreshError: string | null
   readonly showWebsiteNavigation: boolean
+  /** Selected website id from the CHAT_SITES registry. */
+  readonly site: string
+  /** Per-site login state of the sites whose login memory this plugin owns. */
+  /** User-added websites, published so the switcher and settings can show them. */
+  readonly customSites?: readonly ChatSite[]
+  readonly siteLogin?: Readonly<Record<string, boolean>>
+  readonly siteImportError?: string | null
+  readonly siteImportWarning?: string | null
   readonly switchPreferences?: SwitchPreferences
   readonly switchPreferencesStatus?: 'loading' | 'ready' | 'unavailable'
   readonly switchPreferencesPending?: boolean
@@ -82,6 +95,7 @@ export interface DshChatUIBridge {
   updateBrandAnchor(rect: DshChatViewportRect | null, owner?: HTMLElement): void
   attachSidebar(element: HTMLElement): void
   reloadWebsite(): void
+  selectSite(id: string): void
   refreshWebsiteNavigation(): void
   reportWebsiteNavigationRefresh(generation: number, state: { readonly requestId: number; readonly refreshing: boolean; readonly error: string | null }): void
   reportWebsiteState(generation: number, state: { readonly loading: boolean; readonly error: string | null }): void
@@ -104,6 +118,16 @@ export interface DshChatUIBridge {
   saveWebsiteFile(file: WebsiteFile): void
   /** Non-fatal status feedback for links and exports; never a page-load error. */
   reportWebsiteNotice(generation: number, notice: WebsiteNotice | null): void
+  /** Site login memory for the registered non-DeepSeek sites. */
+  importSiteSession(site: string, cookieText: string): Promise<number>
+  loadSiteSession(generation: number, site: string): Promise<SiteSession | null>
+  /** Adds a user-defined website; false when the URL is unusable or already added. */
+  addCustomSite(label: string, url: string, icon: string): boolean
+  /** Removes a user-defined website and returns to the default site. */
+  removeCustomSite(id: string): void
+  clearSiteLogin(site: string): Promise<boolean>
+  probeSiteLogins(reports: Record<string, boolean>): void
+  reportSiteGuest(generation: number, partition: string): void
 }
 
 export interface DshChatBridgeProps { readonly bridge: DshChatUIBridge }
@@ -131,6 +155,12 @@ function PanelIcon() {
   </svg>
 }
 
+/** A plain plus, so adding a website never looks like the new-conversation button. */
+function AddSiteIcon() {
+  return <svg width="16" height="16" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+    <path d="M10 4v12M4 10h12" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+  </svg>
+}
 /** rc.2's official wordmark includes its HARNESS badge in the SVG artwork.
  * Crop only our own presentation to the DeepSeek lettering (x=26..128). */
 function DshChatWordmark() {
@@ -314,10 +344,13 @@ function DshChatConversationRow({bridge, item, selected, disabled, onRename, lan
   const t = (text: string | null | undefined) => translate(language, text)
   const [open, setOpen] = useState(false)
   const pinned = /^(置顶|Pinned|Pin)$/i.test(item.group)
+  // Rename/pin/share/delete act through the DeepSeek site's own menus; a
+  // native site's list stays read-only until its own actions are confirmed.
+  const nativeSite = bridge.getSnapshot().site !== 'deepseek'
   useLayoutEffect(() => { if (disabled) setOpen(false) }, [disabled])
   return <div className="dsh-chat-conversation-item" data-selected={selected || undefined} data-menu-open={open || undefined}>
     <button type="button" className="dsh-chat-conversation-row" title={item.title} aria-current={selected ? 'page' : undefined} disabled={disabled} onDoubleClick={onRename} onClick={()=>bridge.commandWebsite({type:'open',href:item.href})}>{item.title}</button>
-    <Menu open={open && !disabled} portal closeOnPointerLeave onClose={()=>setOpen(false)} anchor={
+    {!nativeSite && <Menu open={open && !disabled} portal closeOnPointerLeave onClose={()=>setOpen(false)} anchor={
       <button type="button" className="dsh-chat-conversation-more dsh-chat-icon-button" aria-label={t('更多操作：{title}').replace('{title}',item.title)} aria-haspopup="menu" aria-expanded={open} disabled={disabled} onClick={()=>setOpen(value=>!value)}><IconEllipsisOutlineRegular size={16}/></button>
     } items={[
       {id:'rename',label:t('重命名'),icon:<IconEditOutlineRegular size={16}/>},
@@ -328,7 +361,7 @@ function DshChatConversationRow({bridge, item, selected, disabled, onRename, lan
       setOpen(false)
       if(action==='rename') {onRename();return}
       if(action==='pin' || action==='unpin' || action==='share' || action==='delete') bridge.commandWebsite({type:'conversation-action',href:item.href,action})
-    }}/>
+    }}/>}
   </div>
 }
 
@@ -389,10 +422,103 @@ export function guardHarnessSearchReplay(entry: StoredEntry): (() => void) | nul
 }
 
 /** Only the middle browsing region changes; the shipped shell and Settings stay mounted. */
+/** Simplified brand glyphs; stroke/fill follow the host theme via currentColor. */
+/** Built-in glyphs an added website can pick from; all follow the theme. */
+const CUSTOM_SITE_ICONS: readonly string[] = ['auto', 'globe', 'star', 'bolt', 'chat', 'book', 'code']
+
+function CustomSiteGlyph({ icon }: { readonly icon: string }) {
+  const common = { width: 16, height: 16, viewBox: '0 0 20 20', 'aria-hidden': true as const, focusable: 'false' as const }
+  if (icon === 'star') return createElement('svg', common,
+    createElement('path', { d: 'M10 2.2l2.5 5.2 5.6.7-4.1 3.9 1 5.6L10 15l-5 2.6 1-5.6L1.9 8.1l5.6-.7z', fill: 'currentColor' }))
+  if (icon === 'bolt') return createElement('svg', common,
+    createElement('path', { d: 'M11.6 1.5L4 11h4l-.6 7.5L16 8.4h-4.6z', fill: 'currentColor' }))
+  if (icon === 'chat') return createElement('svg', common,
+    createElement('path', { d: 'M3 4.5h14v9H9l-4 3.2V13.5H3z', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinejoin: 'round' }))
+  if (icon === 'book') return createElement('svg', common,
+    createElement('path', { d: 'M3.5 3.5h5.2c.7 0 1.3.6 1.3 1.3v11.4c-.5-.5-1-.7-1.6-.7H3.5zM16.5 3.5h-5.2c-.7 0-1.3.6-1.3 1.3v11.4c.5-.5 1-.7 1.6-.7h4.9z', fill: 'currentColor' }))
+  if (icon === 'code') return createElement('svg', common,
+    createElement('path', { d: 'M7.4 5.6L3 10l4.4 4.4M12.6 5.6L17 10l-4.4 4.4', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round' }))
+  return createElement('svg', common,
+    createElement('circle', { cx: 10, cy: 10, r: 7.2, fill: 'none', stroke: 'currentColor', strokeWidth: 1.5 }),
+    createElement('path', { d: 'M3.2 10h13.6M10 2.8c2.4 2.2 3.6 4.6 3.6 7.2s-1.2 5-3.6 7.2c-2.4-2.2-3.6-4.6-3.6-7.2S7.6 5 10 2.8z', fill: 'none', stroke: 'currentColor', strokeWidth: 1.3 }))
+}
+
+/** Letter tile for an added site: hue comes from the id, so it never shifts. */
+function CustomSiteLetter({ id }: { readonly id: string }) {
+  let hash = 0
+  for (const character of id) hash = (hash * 31 + character.codePointAt(0)!) % 360
+  // www.example.com reads as E, not W: the subdomain says nothing about the site.
+  const letter = siteInitialLetter(id)
+  return <span className='dsh-chat-site-letter' style={{ background: 'hsl(' + hash + ' 62% 46%)' }} aria-hidden='true'>{letter}</span>
+}
+function SiteIcon({ id, site }: { readonly id: string; readonly site?: ChatSite }) {
+  if (id === 'deepseek') return <DeepseekLogo/>
+  if (id === 'chatgpt') return <ChatGptLogo/>
+  if (id === 'claude') return <ClaudeLogo/>
+  if (id.startsWith('custom-')) {
+    const icon = site?.icon ?? 'auto'
+    return icon === 'auto' ? <CustomSiteLetter id={id}/> : <CustomSiteGlyph icon={icon}/>
+  }
+  if (id === 'gemini') return <GeminiLogo/>
+  const common = { width: 16, height: 16, viewBox: '0 0 20 20', 'aria-hidden': true as const, focusable: 'false' as const }
+  if (id === 'chatgpt') return createElement('svg', common,
+    createElement('path', { d: 'M10 1.6l7.2 4.2v8.4L10 18.4 2.8 14.2V5.8z', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinejoin: 'round' }),
+    createElement('path', { d: 'M10 6.4l3.6 2.1v4.2L10 14.8l-3.6-2.1V8.5z', fill: 'currentColor' }))
+  if (id === 'claude') return createElement('svg', common,
+    createElement('path', { d: 'M10 1.5v17M1.5 10h17M4 4l12 12M16 4L4 16', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round' }))
+  if (id === 'gemini') return createElement('svg', common,
+    createElement('path', { d: 'M10 1c.9 5.2 3.8 8.1 9 9-5.2.9-8.1 3.8-9 9-.9-5.2-3.8-8.1-9-9 5.2-.9 8.1-3.8 9-9z', fill: 'currentColor' }))
+  // DeepSeek: a simplified whale silhouette.
+  return createElement('svg', common,
+    createElement('path', { d: 'M2.5 11.5c0-2.2 2-3.8 4.6-3.8 1.6 0 2.9.6 3.7 1.6 1.9-.9 4.3-.6 5.8.8.7.6 1 1.4.9 2.2-.1.8-.7 1.4-1.6 1.7-1.2.4-2.7.5-4.2.3-1.9-.3-3.4-1.1-4.4-2.2-.9.4-2 .5-3 .2-1.1-.3-1.8-0-1.8-.8z', fill: 'currentColor' }),
+    createElement('circle', { cx: 6.4, cy: 9.6, r: 0.9, fill: 'var(--dsw-alias-bg-base,#fff)' }))
+}
+
+/** Adding a website is a modal: the sidebar row stays a single line of buttons. */
+function DshChatAddSite({ bridge, language, onClose }: DshChatBridgeProps & { language: ChatLanguage | null; onClose: () => void }) {
+  const t = (text: string | null | undefined) => translate(language, text)
+  const [label, setLabel] = useState('')
+  const [url, setUrl] = useState('')
+  const [icon, setIcon] = useState('auto')
+  const [error, setError] = useState<string | null>(null)
+  const trimmed = url.trim()
+  const confirm = () => {
+    if (trimmed.length === 0) return
+    if (bridge.addCustomSite(label, trimmed, icon)) { onClose(); return }
+    setError(t('无法添加：请检查网址是否为 https 开头，或该网站已添加。'))
+  }
+  return <Modal open onClose={onClose} closeLabel={t("关闭")} title={t("添加网站")} footer={<>
+    <Button variant="outline" onClick={onClose}>{t("取消")}</Button>
+    <Button variant="primary" disabled={trimmed.length === 0} onClick={confirm}>{t("添加")}</Button>
+  </>}>
+    <DshChatStyles/>
+    <div className="dsh-chat-add-field">
+      <span className="dsh-chat-add-label">{t("网站名称（可留空）")}</span>
+      <input className="dsh-chat-rename-input" value={label} aria-label={t("网站名称（可留空）")} placeholder={t("网站名称（可留空）")} maxLength={40}
+        onChange={event=>{setLabel(event.target.value);setError(null)}}/>
+    </div>
+    <div className="dsh-chat-add-field">
+      <span className="dsh-chat-add-label">{t("网站网址")}</span>
+      <input className="dsh-chat-rename-input" value={url} aria-label={t("网站网址")} placeholder="https://example.com" inputMode="url" spellCheck={false} maxLength={300}
+        onChange={event=>{setUrl(event.target.value);setError(null)}}/>
+    </div>
+    <div className="dsh-chat-add-field">
+      <span className="dsh-chat-add-label">{t("网站图标")}</span>
+      <div className="dsh-chat-icon-picker" role="radiogroup" aria-label={t("网站图标")}>
+        {CUSTOM_SITE_ICONS.map(option => <button key={option} type="button" role="radio" aria-checked={icon === option}
+          className="dsh-chat-icon-option" data-selected={icon === option || undefined} title={t(option === 'auto' ? '首字母' : option)}
+          onClick={()=>setIcon(option)}>{option === 'auto' ? <CustomSiteLetter id={url.trim() || 'auto'}/> : <CustomSiteGlyph icon={option}/>}</button>)}
+      </div>
+    </div>
+    {error && <div className="dsh-chat-rename-error" role="alert">{t(error)}</div>}
+    <p className="dsh-chat-settings-hint">{t('添加后可在 设置 → Chat 设置 → 网站登录 里导入该网站的 Cookie。')}</p>
+  </Modal>
+}
 export function DshChatChatNavigation({ bridge, wide, expandSidebar }: PropsRuntime<'sidebar.workspaces'> & DshChatBridgeProps) {
   const state = useDshChat(bridge)
   const t = (text: string | null | undefined) => translate(state.language, text)
   const [renameTarget,setRenameTarget] = useState<WebsiteNavigation['conversations'][number] | null>(null)
+  const [addingSite, setAddingSite] = useState(false)
   const [query, setQuery] = useState('')
   const [searching, setSearching] = useState(false)
   const searchRoot = useRef<HTMLDivElement>(null)
@@ -420,9 +546,18 @@ export function DshChatChatNavigation({ bridge, wide, expandSidebar }: PropsRunt
     const rows = groups.get(item.group) ?? []
     rows.push(item); groups.set(item.group, rows)
   }
+  const allSites = allSitesOf(state.customSites)
+  const siteLabelOf = (site: { id: string }) => site.id.startsWith('custom-')
+    ? (state.customSites ?? []).find(entry => entry.id === site.id)?.label ?? site.id : siteLabel(site.id)
+  const siteRow = <div className="dsh-chat-site-row" role="group" aria-label={t('切换网站')}>
+    {allSites.map(site => <button key={site.id} type="button" className="dsh-chat-site-button" data-active={site.id === state.site || undefined} aria-pressed={site.id === state.site} aria-label={siteLabelOf(site)} title={siteLabelOf(site)} disabled={site.id === state.site} onClick={()=>bridge.selectSite(site.id)}><SiteIcon id={site.id} site={site}/></button>)}
+    <button type="button" className="dsh-chat-site-button dsh-chat-site-add" aria-label={t('添加网站')} title={t('添加网站')} onClick={()=>setAddingSite(true)}><AddSiteIcon/></button>
+  </div>
   return <section className={`dsh-chat-navigation${wide ? '' : ' dsh-chat-navigation-rail'}`} aria-label={t("官网对话导航")}>
     <DshChatStyles />
     {renameTarget && <DshChatRenameConversation key={renameTarget.href} bridge={bridge} language={state.language} item={renameTarget} onClose={()=>setRenameTarget(null)}/>}
+    {addingSite && <DshChatAddSite bridge={bridge} language={state.language} onClose={()=>setAddingSite(false)}/>}
+    {siteRow}
     {!wide ? <button type="button" className="dsh-chat-icon-button" onClick={expandSidebar} aria-label={t("展开官网对话列表")}><PanelIcon /></button> : <>
       <header className="dsh-chat-navigation-header" data-searching={searching || undefined}>
         <span className="dsh-chat-search-label">{t("对话")}</span>
@@ -586,6 +721,32 @@ export function DshChatChatSettings({bridge,close}: PropsRuntime<'settings.secti
     close()
     bridge.beginWebsiteSignIn()
   }
+  const siteLogin = state.siteLogin ?? {}
+  const [importTarget, setImportTarget] = useState<string | null>(null)
+  const [importDraft, setImportDraft] = useState("")
+  const [importBusy, setImportBusy] = useState<string | null>(null)
+  const [importError, setImportError] = useState<string | null>(null)
+  const readClipboard = async () => {
+    setImportError(null)
+    try {
+      const text = await navigator.clipboard.readText()
+      if (text.trim().length === 0) { setImportError("剪贴板是空的。请先在浏览器里复制 Cookie。"); return }
+      setImportDraft(text)
+    } catch { setImportError("无法读取剪贴板，请直接在输入框里粘贴（Ctrl+V）。") }
+  }
+  const saveImport = async (id: string) => {
+    setImportBusy(id); setImportError(null)
+    const saved = await bridge.importSiteSession(id, importDraft).catch(() => 0)
+    setImportBusy(null)
+    if (saved === 0) { setImportError(state.siteImportError || "未识别到该网站的登录 Cookie，请确认已登录并复制了整行 Cookie。"); return }
+    setImportError(null); setImportTarget(null); setImportDraft("")
+  }
+  const clearLogin = async (id: string) => {
+    setImportBusy(id); setImportError(null)
+    const cleared = await bridge.clearSiteLogin(id).catch(() => false)
+    setImportBusy(null)
+    if (!cleared) setImportError("清除失败，请重试。")
+  }
   const navigation = state.websiteNavigation
   const settings = navigation.settings
   const showAccount = enabled && navigation.authenticated===true && !['signed-out','signing-in','signing-out'].includes(state.websiteAuthenticationStatus)
@@ -602,7 +763,7 @@ export function DshChatChatSettings({bridge,close}: PropsRuntime<'settings.secti
         <div className="dsh-chat-settings-account" role="group" aria-label={t("DeepSeek 官网账号")}>
           <div className="dsh-chat-settings-identity"><strong title={accountName}>{accountName}</strong><span className="dsh-chat-settings-badge">{t("已登录")}</span></div>
           <div className="dsh-chat-settings-actions">
-            <a className="dsh-chat-settings-external" href="https://chat.deepseek.com/" target="_blank" rel="noopener noreferrer">{t('打开网页端')} <span aria-hidden="true">↗</span></a>
+            <a className="dsh-chat-settings-external" href={siteById(state.site).url} target="_blank" rel="noopener noreferrer">{t('打开网页端')} <span aria-hidden="true">↗</span></a>
             <Button className="dsh-chat-settings-logout" variant="outline" disabled={!logoutError && (navigation.status!=='ready' || settings?.pending)} onClick={()=>bridge.logoutWebsite()}>{t(logoutError ? "重试退出登录" : "退出登录")}</Button>
           </div>
         </div>
@@ -614,6 +775,39 @@ export function DshChatChatSettings({bridge,close}: PropsRuntime<'settings.secti
       </div>}
       {!accountError && recognitionError && <div className="dsh-chat-settings-error" role="alert"><p>{t(recognitionError)}</p><Button variant="outline" onClick={()=>bridge.commandWebsite({type:'snapshot',showOriginal:false})}>{t("重新识别")}</Button></div>}
       {enabled && showAccount && settings?.error && <div className="dsh-chat-settings-error" role="alert"><p>{t(settings.error)}</p><Button variant="outline" disabled={Boolean(settings.pending)} onClick={()=>bridge.commandWebsite({type:'settings-retry'})}>{t("重试同步")}</Button></div>}
+    </section>
+    <section className="dsh-chat-settings-card dsh-chat-site-settings" aria-label={t("网站登录")}>
+      <div className="dsh-chat-settings-identity"><strong>{t("网站登录")}</strong></div>
+      <p className="dsh-chat-settings-hint">{t("当前 DSH 版本的内嵌网页会话不跨重启保存。在浏览器登录对应网站后，从开发者工具复制 Cookie 粘贴到此处，即可在重启后保持登录。")}</p>
+      <p className="dsh-chat-settings-hint">{t("注意：用谷歌登录的网站共享同一份谷歌身份（浏览器配置文件的限制）。需在不同网站用不同谷歌账号时，请在浏览器里添加谷歌多账号，并按网站记住对应的账号序号。")}</p>
+      {[...SITE_LOGIN_IDS, ...(state.customSites ?? []).map(site => site.id)].map(id => {
+        const signedIn = siteLogin[id] === true
+        const importing = importTarget === id
+        return <div className="dsh-chat-site-login-row" key={id} role="group" aria-label={siteLabel(id)}>
+          <div className="dsh-chat-settings-identity">
+            <SiteIcon id={id} site={(state.customSites ?? []).find(entry => entry.id === id)}/>
+            <strong>{id.startsWith('custom-') ? (state.customSites ?? []).find(entry => entry.id === id)?.label ?? id : siteLabel(id)}</strong>
+            {signedIn && <span className="dsh-chat-settings-badge">{t("已登录")}</span>}
+          </div>
+          <div className="dsh-chat-settings-actions">
+            <a className="dsh-chat-settings-external" href={siteById(id).url} target="_blank" rel="noopener noreferrer">{t("打开网页端")} <span aria-hidden="true">↗</span></a>
+            <Button className="dsh-chat-settings-logout" variant="outline" onClick={() => { setImportTarget(importing ? null : id); setImportDraft(""); setImportError(null) }}>{t(importing ? "收起" : "导入 Cookie")}</Button>
+            <Button className="dsh-chat-settings-logout" variant="outline" disabled={!signedIn || importBusy !== null} onClick={() => void clearLogin(id)}>{t("清除")}</Button>
+            {id.startsWith('custom-') && <Button className="dsh-chat-settings-logout" variant="outline" onClick={()=>bridge.removeCustomSite(id)}>{t("移除网站")}</Button>}
+          </div>
+          {importing && <div className="dsh-chat-site-import">
+            <p className="dsh-chat-settings-hint">{t("在浏览器登录该网站 → F12 → Application/应用 → Cookies → 选中该站点 → 点开第一条 Cookie → Ctrl+A 全选 → Ctrl+C 复制 → 粘贴到下面。也支持扩展导出的 name=value; name2=value2 单行格式。只需一次，重启后自动恢复。")}</p>
+            <textarea className="dsh-chat-site-import-input" value={importDraft} rows={3} spellCheck={false}
+              placeholder="name=value; name2=value2" onChange={event => setImportDraft(event.target.value)}/>
+            <div className="dsh-chat-settings-actions">
+              <Button variant="outline" disabled={importBusy !== null} onClick={() => void readClipboard()}>{t("读取剪贴板")}</Button>
+              <Button variant="primary" disabled={importDraft.trim().length === 0 || importBusy !== null} onClick={() => void saveImport(id)}>{t(importBusy === id ? "保存中" : "保存")}</Button>
+            </div>
+            {(importError || state.siteImportError) && <div className="dsh-chat-settings-error" role="alert"><p>{t(importError || state.siteImportError)}</p></div>}
+            {state.siteImportWarning && <div className="dsh-chat-settings-hint" role="status"><p>{t(state.siteImportWarning)}</p></div>}
+          </div>}
+        </div>
+      })}
     </section>
     <ChatPresentationSettings bridge={bridge} state={state}/>
   </section>

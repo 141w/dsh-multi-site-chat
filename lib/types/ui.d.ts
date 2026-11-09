@@ -3,9 +3,10 @@ import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots';
 import type { WebsiteFile } from './website-downloads.js';
 import type { WebsiteCommand, WebsiteNavigation } from './website-navigation.js';
 import type { ChatLanguage } from './website-settings.js';
-import type { WebsiteSession } from './protocol.js';
 import type { WindowDragRegion } from './window-drag.js';
 import { type SwitchPreferences } from './preferences.js';
+import type { SiteSession, WebsiteSession } from './protocol.js';
+import { type ChatSite } from './sites.js';
 export type DshChatMode = 'chat' | 'harness';
 export interface DshChatViewportRect {
     readonly left: number;
@@ -44,6 +45,14 @@ export interface DshChatViewState {
     readonly websiteNavigationRefreshing: boolean;
     readonly websiteNavigationRefreshError: string | null;
     readonly showWebsiteNavigation: boolean;
+    /** Selected website id from the CHAT_SITES registry. */
+    readonly site: string;
+    /** Per-site login state of the sites whose login memory this plugin owns. */
+    /** User-added websites, published so the switcher and settings can show them. */
+    readonly customSites?: readonly ChatSite[];
+    readonly siteLogin?: Readonly<Record<string, boolean>>;
+    readonly siteImportError?: string | null;
+    readonly siteImportWarning?: string | null;
     readonly switchPreferences?: SwitchPreferences;
     readonly switchPreferencesStatus?: 'loading' | 'ready' | 'unavailable';
     readonly switchPreferencesPending?: boolean;
@@ -66,6 +75,7 @@ export interface DshChatUIBridge {
     updateBrandAnchor(rect: DshChatViewportRect | null, owner?: HTMLElement): void;
     attachSidebar(element: HTMLElement): void;
     reloadWebsite(): void;
+    selectSite(id: string): void;
     refreshWebsiteNavigation(): void;
     reportWebsiteNavigationRefresh(generation: number, state: {
         readonly requestId: number;
@@ -95,6 +105,16 @@ export interface DshChatUIBridge {
     saveWebsiteFile(file: WebsiteFile): void;
     /** Non-fatal status feedback for links and exports; never a page-load error. */
     reportWebsiteNotice(generation: number, notice: WebsiteNotice | null): void;
+    /** Site login memory for the registered non-DeepSeek sites. */
+    importSiteSession(site: string, cookieText: string): Promise<number>;
+    loadSiteSession(generation: number, site: string): Promise<SiteSession | null>;
+    /** Adds a user-defined website; false when the URL is unusable or already added. */
+    addCustomSite(label: string, url: string, icon: string): boolean;
+    /** Removes a user-defined website and returns to the default site. */
+    removeCustomSite(id: string): void;
+    clearSiteLogin(site: string): Promise<boolean>;
+    probeSiteLogins(reports: Record<string, boolean>): void;
+    reportSiteGuest(generation: number, partition: string): void;
 }
 export interface DshChatBridgeProps {
     readonly bridge: DshChatUIBridge;
@@ -117,7 +137,6 @@ export declare function DshChatBrandControl({ bridge }: DshChatBridgeProps): imp
 /** rc.2 replays its retained request counter on WorkspaceBrowser remount.
  * Adapt only the view hook; never mutate the host request store or actions. */
 export declare function guardHarnessSearchReplay(entry: StoredEntry): (() => void) | null;
-/** Only the middle browsing region changes; the shipped shell and Settings stay mounted. */
 export declare function DshChatChatNavigation({ bridge, wide, expandSidebar }: PropsRuntime<'sidebar.workspaces'> & DshChatBridgeProps): import("react/jsx-runtime").JSX.Element;
 /** Measures only this plugin's own element; website content lives in the retained overlay. */
 export declare function DshChatChatPanel({ bridge }: PropsRuntime<'main'> & DshChatBridgeProps): import("react/jsx-runtime").JSX.Element;

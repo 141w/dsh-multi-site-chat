@@ -22,19 +22,27 @@ try {
     platform: 'node',
     target: 'node22',
     plugins: [{
-      // Client DI integration tests exercise the real controller while keeping
-      // presentation modules inert. Native guest/React behavior is not tested here.
+      // Client DI integration tests exercise the real controller and its real
+      // UI modules; only SDK visual primitives are inert, exactly like the
+      // browser fixtures. Native guest/React rendering is not tested here.
       name: 'client-controller-presentation-fixtures',
       setup(plugin) {
-        plugin.onResolve({ filter: /^\.\/(?:ui|web-surface)\.js$/ }, args => {
-          if (path.resolve(args.importer) !== path.join(projectRoot, 'src/client.ts')) return
-          return { path: args.path, namespace: 'client-di-fixture' }
-        })
-        plugin.onLoad({ filter: /.*/, namespace: 'client-di-fixture' }, args => ({
-          contents: args.path === './ui.js'
-            ? 'export const DshChatBrandName = () => null; export const DshChatBrandControl = () => null; export const DshChatChatNavigation = () => null; export const DshChatChatPanel = () => null; export const DshChatLeadingControls = () => null; export const DshChatChatSettings = () => null;'
-            : 'export const DshChatWebSurface = () => null;',
+        // The DSH 0.2.2 SDK ships visual primitives that expect host-provided
+        // modules (clsx, shiki, katex, ...). Keep them inert like the browser
+        // fixtures do; only our own component logic is under test here.
+        plugin.onResolve({ filter: /^@deepseek-ai\/dsh-client-ui-primitives$/ }, () => ({ path: 'primitives', namespace: 'sdk-presentation-inert' }))
+        plugin.onLoad({ filter: /.*/, namespace: 'sdk-presentation-inert' }, () => ({
+          contents: "import { createElement } from 'react';" +
+            "export function Button({ children, variant, ...props }) { return createElement('button', props, children) };" +
+            "export function Input(props) { return createElement('input', props) };" +
+            ['BrandWordmark', 'IconSearchOutlineRegular', 'IconCloseFillRegular', 'IconNewChatOutlineRegular',
+              'IconPanelLeftOutlineRegular', 'IconRefreshOutlineRegular', 'IconLoadingOutlineRegular',
+              'IconEllipsisOutlineRegular', 'IconEditOutlineRegular', 'IconPinOutlineRegular',
+              'IconShareOutlineRegular', 'IconTrashOutlineRegular', 'IconChevronDownOutlineRegular',
+              'Menu', 'Modal', 'Tooltip']
+              .map(name => `export const ${name} = ({ children, ...props }) => createElement('span', props, children);`).join(''),
           loader: 'js',
+          resolveDir: projectRoot,
         }))
       },
     }],

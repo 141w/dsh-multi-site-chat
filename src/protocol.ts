@@ -44,6 +44,44 @@ export const websiteSessionSchema = z.strictObject({
   deviceId: z.string().uuid(),
 }) satisfies z.ZodType<WebsiteSession>
 
+/**
+ * One captured cookie of a registered site. It travels only inside the plugin's
+ * own Host bridge and rests only in the profile-scoped credential vault.
+ */
+export interface SiteCookie {
+  name: string
+  value: string
+  domain: string
+  path: string
+  secure: boolean
+  httpOnly: boolean
+  sameSite: 'strict' | 'lax' | 'none' | 'unspecified'
+  /** Epoch seconds; null is a session cookie. */
+  expires: number | null
+}
+
+export const siteCookieSchema = z.strictObject({
+  name: z.string().min(1).max(256),
+  value: z.string().min(0).max(16_384),
+  domain: z.string().min(1).max(256),
+  path: z.string().min(1).max(256),
+  secure: z.boolean(),
+  httpOnly: z.boolean(),
+  sameSite: z.enum(['strict', 'lax', 'none', 'unspecified']),
+  expires: z.number().int().min(0).nullable(),
+}) satisfies z.ZodType<SiteCookie>
+
+/** A site's remembered login: the minimal sufficient cookie set, nothing else. */
+export interface SiteSession {
+  site: string
+  cookies: readonly SiteCookie[]
+}
+
+export const siteSessionSchema = z.strictObject({
+  site: z.string().min(1).max(64),
+  cookies: z.array(siteCookieSchema).max(128),
+}) satisfies z.ZodType<SiteSession>
+
 const strict = (name: string, schema: z.ZodType) => ({
   mode: 'strict' as const, typeSymbol: `dsh-deepseek-chat#${name}`, create: () => schema,
 })
@@ -74,11 +112,31 @@ const websiteDescriptor = (method: string, save = false): InvocationDescriptor =
     : strict('WebsiteSessionOperationResult', z.boolean()),
 })
 
+const siteParameter = {
+  name: 'site', wire: 'site', source: 'json' as const,
+  codec: strict('ChatSiteId', z.string().min(1).max(64)),
+}
+const siteCookiesParameter = {
+  name: 'cookies', wire: 'cookies', source: 'json' as const,
+  codec: strict('SiteCookieList', z.array(siteCookieSchema).max(128)),
+}
+const siteDescriptor = (method: string, save = false): InvocationDescriptor => ({
+  id: `dsh-deepseek-chat#dshDeepseekChat/${method}`, service: 'dshDeepseekChat', namespace: 'dshDeepseekChat', method,
+  invocation: { kind: 'direct' },
+  parameters: [metadataParameter, epochParameter, siteParameter, ...(save ? [siteCookiesParameter] : [])],
+  cancellation: { parameter: 'signal' },
+  result: method === 'loadSiteSession'
+    ? strict('OptionalSiteSession', siteSessionSchema.nullable())
+    : strict('SiteSessionOperationResult', z.boolean()),
+})
+
 /** Explicit strict descriptors use the public registry; no source-mode method discovery. */
 export const DSH_CHAT_DESCRIPTORS: readonly InvocationDescriptor[] = [
   descriptor('authorization'), descriptor('watchAuthorization', true),
   websiteDescriptor('loadWebsiteSession'), websiteDescriptor('saveWebsiteSession', true),
   websiteDescriptor('clearWebsiteSession'),
+  siteDescriptor('saveSiteSession', true), siteDescriptor('loadSiteSession'),
+  siteDescriptor('clearSiteSession'),
 ]
 export const DSH_CHAT_REMOTE_CONTRIBUTION: TypertRemoteContribution = {
   package: 'dsh-deepseek-chat', descriptors: DSH_CHAT_DESCRIPTORS,
@@ -96,6 +154,9 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
     'dshDeepseekChat/loadWebsiteSession': (metadata: DshChatClientMetadata, epoch: string, signal?: AbortSignal) => Promise<RemoteResult<WebsiteSession | null>>
     'dshDeepseekChat/saveWebsiteSession': (metadata: DshChatClientMetadata, epoch: string, session: WebsiteSession, signal?: AbortSignal) => Promise<RemoteResult<boolean>>
     'dshDeepseekChat/clearWebsiteSession': (metadata: DshChatClientMetadata, epoch: string, signal?: AbortSignal) => Promise<RemoteResult<boolean>>
+    'dshDeepseekChat/saveSiteSession': (metadata: DshChatClientMetadata, epoch: string, site: string, cookies: readonly SiteCookie[], signal?: AbortSignal) => Promise<RemoteResult<boolean>>
+    'dshDeepseekChat/loadSiteSession': (metadata: DshChatClientMetadata, epoch: string, site: string, signal?: AbortSignal) => Promise<RemoteResult<SiteSession | null>>
+    'dshDeepseekChat/clearSiteSession': (metadata: DshChatClientMetadata, epoch: string, site: string, signal?: AbortSignal) => Promise<RemoteResult<boolean>>
   }
   interface TypertRemoteNamespaceMap {
     dshDeepseekChat: import('@deepseek-ai/dsh-typert-protocol').TypertRemoteNamespace<'dshDeepseekChat'>

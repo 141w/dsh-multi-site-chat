@@ -22,15 +22,22 @@ function harness(original: string | null = 'plugins', compatible = true) {
     navigate: (next: string | null) => { panel = next; controller.observePanel(next) } }
 }
 
-test('startup gate, direct panel entry, and missing Desktop never bypass authorization', () => {
+test('compatibility gate only: pending authorization never blocks CHAT, missing Desktop always does', () => {
+  // The 2026-10-11 product decision decoupled CHAT from the DSH account gate:
+  // only plugin compatibility (desktop browser capability) controls entry.
   const h = harness()
-  assert.equal(h.controller.select('chat'), false)
+  assert.equal(h.controller.getSnapshot().authorization.status, 'pending')
+  assert.equal(h.controller.select('chat'), true)
+  assert.equal(h.mounted(), 1)
+  assert.equal(h.panel(), CHAT_PANEL)
   h.navigate(CHAT_PANEL)
-  assert.equal(h.panel(), 'plugins')
-  assert.equal(h.mounted(), 0)
+  assert.equal(h.controller.getSnapshot().mode, 'chat')
   const web = harness(null, false)
   web.controller.updateAuthorization(authorized())
   assert.equal(web.controller.select('chat'), false)
+  web.navigate(CHAT_PANEL)
+  assert.equal(web.panel(), null)
+  assert.equal(web.mounted(), 0)
 })
 
 test('valid refresh keeps chosen mode and one original panel; manual exit restores before unmount', () => {
@@ -46,19 +53,23 @@ test('valid refresh keeps chosen mode and one original panel; manual exit restor
   assert.deepEqual(h.order.slice(-2), ['panel:plugins', 'unmount'])
 })
 
-test('confirmed signout and account replacement recover immediately without auto reentry', () => {
+test('authorization transitions never gate or force the mode; only a replaced account cancels its predecessor', () => {
+  // Website sign-out and grant replacement no longer disable the switcher or
+  // force HARNESS; they only retire the previous account's in-flight work.
   const h = harness(null)
   h.controller.updateAuthorization(authorized())
   h.controller.select('chat')
   h.controller.updateAuthorization({ status: 'unauthorized', accountId: null, epoch: 'closed', error: null })
-  assert.equal(h.panel(), null)
-  assert.equal(h.controller.canEnter(), false)
-  assert.equal(h.mounted(), 0)
-  h.controller.updateAuthorization(authorized('B', 'grant-b'))
-  assert.equal(h.controller.getSnapshot().mode, 'harness')
-  h.controller.select('chat')
+  assert.equal(h.controller.getSnapshot().mode, 'chat')
+  assert.equal(h.controller.canEnter(), true)
+  assert.equal(h.mounted(), 1)
+  assert.ok(h.order.includes('cancel:A'))
   h.controller.updateAuthorization(authorized('A', 'grant-new'))
-  assert.equal(h.controller.getSnapshot().mode, 'harness')
+  assert.equal(h.controller.getSnapshot().mode, 'chat')
+  h.controller.updateAuthorization(authorized('B', 'grant-b'))
+  assert.ok(h.order.includes('cancel:A'))
+  assert.equal(h.controller.getSnapshot().mode, 'chat')
+  h.controller.select('harness')
   assert.equal(h.panel(), null)
 })
 

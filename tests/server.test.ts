@@ -3,9 +3,14 @@ import test from 'node:test'
 import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
+import { tmpdir } from 'node:os'
+import { resolve } from 'node:path'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { DshChatUIBridge } from '../src/ui.js'
+import { WEBSITE_PROFILE_PREFIX } from '../src/authorization.js'
+import { WEBSITE_SESSION_ORIGIN } from '../src/protocol.js'
+import { credentialKey } from '@deepseek-ai/dsh-credentials'
 
 // Compile only our Service; load the real packages from the project so Cordis,
 // its registry, and the Gateway keep their published runtime identities.
@@ -46,7 +51,12 @@ test('published Cordis and Typert Host/Client bind strict methods and withdraw t
   // Published Client artifacts use DSH's lazyCJS loader. Run the actual
   // published factory with the same shared Cordis module supplied above.
   let ClientGateway: object | undefined
-  const clientArtifact = await readFile(require.resolve('@deepseek-ai/dsh-api-gateway/client'), 'utf8')
+  // The 0.2.2 SDK publishes an ESM node artifact and a lazy-CJS browser artifact.
+  // DSH web loads the browser one through __ModuleLoader__; load exactly that.
+  const gatewayDir = path.dirname(require.resolve('@deepseek-ai/dsh-api-gateway/package.json'))
+  const gatewayExports = require('@deepseek-ai/dsh-api-gateway/package.json').exports as Record<string, { browser?: string; default?: string }>
+  const clientEntry = gatewayExports['./client'].browser ?? gatewayExports['./client'].default
+  const clientArtifact = await readFile(path.join(gatewayDir, clientEntry), 'utf8')
   new Function('window', clientArtifact)({
     __ModuleLoader__: { load: (contribution: { factory: (load: typeof require) => object }) => {
       ClientGateway = contribution.factory(require)
@@ -64,6 +74,13 @@ test('published Cordis and Typert Host/Client bind strict methods and withdraw t
     },
   }
   const ctx = new Context()
+  // Host services the 0.2.2 Gateway declares; the fixture only exercises direct invocation.
+  ctx.provide('remoteAccess', { decide: () => ({ kind: 'allow' }) })
+  ctx.provide('connection', { rpc: { intercept: () => () => {} } })
+  // A trusted launcher profile scopes the plugin's own vault records.
+  const profileDir = await mkdtemp(path.join(tmpdir(), 'dsh-chat-profile-'))
+  t.after(async () => { await rm(profileDir, { recursive: true, force: true }) })
+  ctx.provide('profileContext', { dir: profileDir })
   ctx.provide('deepseekAccount', account)
   // Isolated in-memory records only; this never instantiates a real vault provider.
   type Record = { kind: 'grant'; payload: unknown }
@@ -99,6 +116,13 @@ test('published Cordis and Typert Host/Client bind strict methods and withdraw t
   await registry
   const gateway = ctx.plugin(TypertGateway)
   await gateway
+  // The 0.2.2 Gateway requires every direct caller to name its Peer explicitly.
+  const peerController = new AbortController()
+  const ownerPeer = {
+    id: 'fixture-owner-peer', ctx, principal: { kind: 'owner' } as const,
+    signal: peerController.signal, interactions: 'none' as const, dispose: async () => {},
+  }
+  t.after(() => peerController.abort())
   const controller = ctx.plugin(DshChatController)
   await controller
   let disposed = false
@@ -107,42 +131,44 @@ test('published Cordis and Typert Host/Client bind strict methods and withdraw t
     await gateway.dispose()
     await registry.dispose()
   })
-  assert.equal(ctx.typert.local.get('dshChat/authorization').parameters[0].codec.mode, 'strict')
-  const authorized = await ctx.typertGateway.invoke({ namespace: 'dshChat', method: 'authorization', args: { metadata } })
+  assert.equal(ctx.typert.local.get('dshDeepseekChat/authorization').parameters[0].codec.mode, 'strict')
+  const profileId = `${WEBSITE_PROFILE_PREFIX}${createHash('sha256').update(resolve(profileDir), 'utf8').digest('hex')}`
+  const authorized = await ctx.typertGateway.invoke({ namespace: 'dshDeepseekChat', method: 'authorization', args: { metadata }, peer: ownerPeer })
   assert.equal(authorized.status, 'authorized')
-  assert.equal(authorized.accountId, 'fixture-account')
+  // Since the 2026-10-11 decision the Host gate is profile-scoped and
+  // account-free: the DSH account never authorizes, gates or re-epochs CHAT.
+  assert.equal(authorized.accountId, profileId)
   assert.ok(authorized.epoch)
   assert.equal('token' in authorized, false)
   ctx.emit('credentials/record-updated', 'fixture-unrelated/default')
-  assert.equal(ctx.dshChat.authority.getSnapshot().epoch, authorized.epoch)
+  assert.equal(ctx.dshDeepseekChat.authority.getSnapshot().epoch, authorized.epoch)
   ctx.emit('credentials/record-updated', 'deepseek-account-platform/default')
-  const replacing = ctx.dshChat.authority.getSnapshot()
-  assert.equal(replacing.status, 'pending')
-  assert.equal(replacing.accountId, null)
-  assert.notEqual(replacing.epoch, authorized.epoch)
-  const reauthorized = await ctx.typertGateway.invoke({ namespace: 'dshChat', method: 'authorization', args: { metadata } })
-  assert.equal(reauthorized.status, 'authorized')
-  assert.notEqual(reauthorized.epoch, authorized.epoch)
+  const replacing = ctx.dshDeepseekChat.authority.getSnapshot()
+  assert.equal(replacing.status, 'authorized')
+  assert.equal(replacing.accountId, profileId)
+  assert.equal(replacing.epoch, authorized.epoch)
+  const reauthorized = await ctx.typertGateway.invoke({ namespace: 'dshDeepseekChat', method: 'authorization', args: { metadata }, peer: ownerPeer })
+  assert.deepEqual(reauthorized, authorized)
 
   await assert.rejects(ctx.typertGateway.invoke({
-    namespace: 'dshChat', method: 'authorization', args: { metadata: { ...metadata, cookie: 'fixture-only' } },
+    namespace: 'dshDeepseekChat', method: 'authorization', args: { metadata: { ...metadata, cookie: 'fixture-only' } }, peer: ownerPeer,
   }), (error: { code?: string }) => error.code === 'gateway/input-invalid')
   await assert.rejects(ctx.typertGateway.invoke({
-    namespace: 'dshChat', method: 'authorization', args: { metadata }, signal: AbortSignal.abort(),
+    namespace: 'dshDeepseekChat', method: 'authorization', args: { metadata }, signal: AbortSignal.abort(), peer: ownerPeer,
   }), (error: { code?: string }) => error.code === 'gateway/cancelled')
 
   const invokeSession = (method: string, epoch: string, session?: object) => ctx.typertGateway.invoke({
-    namespace: 'dshChat', method, args: { metadata, epoch, ...(session ? { session } : {}) },
+    namespace: 'dshDeepseekChat', method, args: { metadata, epoch, ...(session ? { session } : {}) }, peer: ownerPeer,
   })
-  const ownKey = (id: string) => `dsh-chat/website-${createHash('sha256').update(id, 'utf8').digest('hex')}`
-  const keyA = ownKey('fixture-account')
+  // The v2 grant is keyed by the trusted profile scope, never by a DSH account.
+  const keyA = credentialKey('dsh-deepseek-chat', `website-${profileId.slice(WEBSITE_PROFILE_PREFIX.length)}`)
   let sessionAuthorization = reauthorized
 
   await t.test('website grants use only their own account key, strict three-value payload, and official origin', async () => {
     assert.equal(await invokeSession('loadWebsiteSession', sessionAuthorization.epoch), null)
     assert.equal(await invokeSession('saveWebsiteSession', sessionAuthorization.epoch, fictionalSession), true)
     const expectedRecord = { kind: 'grant', payload: {
-      version: 1, origin: 'https://chat.deepseek.com', fencedDSHaccountId: 'fixture-account', session: fictionalSession,
+      version: 2, origin: WEBSITE_SESSION_ORIGIN, profileId, websiteAccountId: fictionalSession.userId, session: fictionalSession,
     } }
     assert.deepEqual(records.get(keyA), expectedRecord)
     assert.deepEqual(await invokeSession('loadWebsiteSession', sessionAuthorization.epoch), fictionalSession)
@@ -152,53 +178,42 @@ test('published Cordis and Typert Host/Client bind strict methods and withdraw t
         ...fictionalSession, [extra]: 'fixture-only',
       }), (error: { code?: string }) => error.code === 'gateway/input-invalid')
     }
-    await assert.rejects(ctx.typertGateway.invoke({ namespace: 'dshChat', method: 'clearWebsiteSession', args: {
+    await assert.rejects(ctx.typertGateway.invoke({ namespace: 'dshDeepseekChat', method: 'clearWebsiteSession', args: {
       metadata, epoch: sessionAuthorization.epoch, accountId: 'fixture-other-account', credentialKey: officialKey,
-    } }), (error: { code?: string }) => error.code === 'gateway/arguments-invalid')
+    }, peer: ownerPeer }), (error: { code?: string }) => error.code === 'gateway/arguments-invalid')
     for (const payload of [
       { ...expectedRecord.payload, origin: 'https://example.invalid' },
-      { ...expectedRecord.payload, fencedDSHaccountId: 'fixture-other-account' },
+      { ...expectedRecord.payload, profileId: `${WEBSITE_PROFILE_PREFIX}${'f'.repeat(64)}` },
+      { ...expectedRecord.payload, websiteAccountId: 'fixture-other-website-user' },
       { ...expectedRecord.payload, cookie: 'fixture-only' },
     ]) {
       records.set(keyA, { kind: 'grant', payload })
       assert.equal(await invokeSession('loadWebsiteSession', sessionAuthorization.epoch), null)
     }
     records.set(keyA, expectedRecord as Record)
-    assert.equal(credentialCalls.every(call => /^dsh-chat\/website-[a-f0-9]{64}$/.test(call.key)), true)
+    assert.equal(credentialCalls.every(call => /^dsh-(?:chat|deepseek-chat)\/website-[a-f0-9]{64}$/.test(call.key)), true)
   })
 
-  await t.test('stale epochs and another DSH account cannot load, overwrite, or clear the old account grant', async () => {
-    const staleCalls = credentialCalls.length
-    assert.equal(await invokeSession('loadWebsiteSession', authorized.epoch), null)
-    assert.equal(await invokeSession('saveWebsiteSession', authorized.epoch, fictionalSession), false)
-    assert.equal(await invokeSession('clearWebsiteSession', authorized.epoch), false)
-    assert.equal(credentialCalls.length, staleCalls)
+  await t.test('a foreign epoch cannot load, overwrite, or clear the profile-scoped grant', async () => {
+    const foreignCalls = credentialCalls.length
+    const foreignEpoch = 'fixture-foreign-epoch'
+    assert.equal(await invokeSession('loadWebsiteSession', foreignEpoch), null)
+    assert.equal(await invokeSession('saveWebsiteSession', foreignEpoch, fictionalSession), false)
+    assert.equal(await invokeSession('clearWebsiteSession', foreignEpoch), false)
+    assert.equal(credentialCalls.length, foreignCalls)
     const recordA = records.get(keyA)
-    const epochA = sessionAuthorization.epoch
-    accountId = 'fixture-other-account'
-    ctx.emit('credentials/record-updated', officialKey)
-    sessionAuthorization = await ctx.typertGateway.invoke({ namespace: 'dshChat', method: 'authorization', args: { metadata } })
-    assert.notEqual(sessionAuthorization.epoch, epochA)
-    assert.equal(await invokeSession('loadWebsiteSession', epochA), null)
-    assert.equal(await invokeSession('clearWebsiteSession', epochA), false)
-    assert.equal(await invokeSession('loadWebsiteSession', sessionAuthorization.epoch), null)
-    const otherSession = { ...fictionalSession, token: 'fictional-other-website-token', userId: 'fictional-other-website-user' }
-    assert.equal(await invokeSession('saveWebsiteSession', sessionAuthorization.epoch, otherSession), true)
-    assert.deepEqual(await invokeSession('loadWebsiteSession', sessionAuthorization.epoch), otherSession)
-    const keyB = ownKey(accountId)
-    assert.notEqual(keyA, keyB)
-    assert.equal(await invokeSession('clearWebsiteSession', sessionAuthorization.epoch), true)
-    assert.equal(records.has(keyB), false)
-    assert.deepEqual(records.get(keyA), recordA)
-    assert.deepEqual(records.get(officialKey), officialRecord)
-    accountId = 'fixture-account'
-    ctx.emit('credentials/record-updated', officialKey)
-    sessionAuthorization = await ctx.typertGateway.invoke({ namespace: 'dshChat', method: 'authorization', args: { metadata } })
-    assert.notEqual(sessionAuthorization.epoch, epochA)
     assert.deepEqual(await invokeSession('loadWebsiteSession', sessionAuthorization.epoch), fictionalSession)
+    assert.equal(await invokeSession('clearWebsiteSession', sessionAuthorization.epoch), true)
+    // Clearing leaves a durable empty grant so an old account-keyed grant cannot be restored.
+    assert.deepEqual(records.get(keyA), { kind: 'grant', payload: {
+      version: 2, origin: WEBSITE_SESSION_ORIGIN, profileId, websiteAccountId: null, session: null,
+    } })
+    assert.deepEqual(records.get(officialKey), officialRecord)
+    assert.deepEqual(await invokeSession('loadWebsiteSession', sessionAuthorization.epoch), null)
+    records.set(keyA, recordA as Record)
   })
 
-  await t.test('renewed authorization fences a write waiting for the credential lock before its mutation callback', async () => {
+  await t.test('a clear fences a write still waiting for the credential lock before its mutation callback', async () => {
     const entered = deferred<void>()
     const release = deferred<void>()
     modifyGate = { entered: () => entered.resolve(), wait: release.promise }
@@ -206,35 +221,44 @@ test('published Cordis and Typert Host/Client bind strict methods and withdraw t
     const epochBefore = sessionAuthorization.epoch
     const saving = invokeSession('saveWebsiteSession', epochBefore, { ...fictionalSession, token: 'fictional-stale-write-token' })
     await entered.promise
-    ctx.emit('credentials/record-updated', officialKey)
-    sessionAuthorization = await ctx.typertGateway.invoke({ namespace: 'dshChat', method: 'authorization', args: { metadata } })
-    assert.notEqual(sessionAuthorization.epoch, epochBefore)
+    // Clearing closes the Host write barrier; the queued save must observe the
+    // new revision inside its mutation callback and decline. The barrier is
+    // armed after the clear's own fence resolves, so yield one macrotask first.
+    const clearing = invokeSession('clearWebsiteSession', epochBefore)
+    await new Promise(resolve => { setTimeout(resolve, 10) })
     release.resolve()
     assert.equal(await saving, false)
-    assert.deepEqual(records.get(keyA), recordBefore)
-    assert.deepEqual(await invokeSession('loadWebsiteSession', sessionAuthorization.epoch), fictionalSession)
+    assert.equal(await clearing, true)
+    assert.deepEqual(records.get(keyA), { kind: 'grant', payload: {
+      version: 2, origin: WEBSITE_SESSION_ORIGIN, profileId, websiteAccountId: null, session: null,
+    } })
+    assert.deepEqual(recordBefore, { kind: 'grant', payload: {
+      version: 2, origin: WEBSITE_SESSION_ORIGIN, profileId, websiteAccountId: fictionalSession.userId, session: fictionalSession,
+    } })
+    assert.deepEqual(records.get(officialKey), officialRecord)
+    assert.deepEqual(await invokeSession('loadWebsiteSession', sessionAuthorization.epoch), null)
   })
 
   await t.test('provider write and clear failures keep the grant and expose only fixed gateway errors', async () => {
+    // Clearing writes a durable empty grant through the same modify seam as saving.
+    assert.equal(await invokeSession('saveWebsiteSession', sessionAuthorization.epoch, fictionalSession), true)
     const retained = records.get(keyA)
     failWrite = true
     await assert.rejects(invokeSession('saveWebsiteSession', sessionAuthorization.epoch, {
       ...fictionalSession, token: 'fictional-rejected-write-token',
     }), (error: { code?: string; message?: string }) => error.code === 'gateway/internal'
       && !String(error.message).includes('fictional-vault-write-detail'))
-    failWrite = false
     assert.deepEqual(records.get(keyA), retained)
-    failDelete = true
     await assert.rejects(invokeSession('clearWebsiteSession', sessionAuthorization.epoch),
       (error: { code?: string; message?: string }) => error.code === 'gateway/internal'
-        && !String(error.message).includes('fictional-vault-delete-detail'))
-    failDelete = false
+        && !String(error.message).includes('fictional-vault-write-detail'))
+    failWrite = false
     assert.deepEqual(records.get(keyA), retained)
     assert.deepEqual(await invokeSession('loadWebsiteSession', sessionAuthorization.epoch), fictionalSession)
     assert.equal(await invokeSession('clearWebsiteSession', sessionAuthorization.epoch), true)
     assert.equal(await invokeSession('loadWebsiteSession', sessionAuthorization.epoch), null)
     assert.deepEqual(records.get(officialKey), officialRecord)
-    assert.equal(credentialCalls.every(call => /^dsh-chat\/website-[a-f0-9]{64}$/.test(call.key)), true)
+    assert.equal(credentialCalls.every(call => /^dsh-(?:chat|deepseek-chat)\/website-[a-f0-9]{64}$/.test(call.key)), true)
   })
 
   // Only the Connection carrier is a local fixture: the Client Remote, its
@@ -249,12 +273,12 @@ test('published Cordis and Typert Host/Client bind strict methods and withdraw t
       call: async (_path: string, endpoint: string, payload: { args: object }, signal: AbortSignal) => {
         carrierCalls++
         const [namespace, method] = endpoint.split('/')
-        const value = await ctx.typertGateway.invoke({ namespace, method, args: payload.args, signal })
+        const value = await ctx.typertGateway.invoke({ namespace, method, args: payload.args, signal, peer: ownerPeer })
         return { ok: true, value }
       },
       async *open(_path: string, endpoint: string, payload: { args: object }, signal: AbortSignal) {
         const [namespace, method] = endpoint.split('/')
-        yield* await ctx.typertGateway.stream({ namespace, method, args: payload.args, signal })
+        yield* await ctx.typertGateway.stream({ namespace, method, args: payload.args, signal, peer: ownerPeer })
       },
     },
   })
@@ -265,46 +289,48 @@ test('published Cordis and Typert Host/Client bind strict methods and withdraw t
   t.after(async () => { await clientGateway.dispose(); await clientRegistry.dispose() })
   const unmountClient = await clientCtx.remote.$mount(DSH_CHAT_REMOTE_CONTRIBUTION)
   t.after(unmountClient)
-  const clientAuthorization = await clientCtx.remote.dshChat.authorization(metadata)
+  const clientAuthorization = await clientCtx.remote.dshDeepseekChat.authorization(metadata)
   assert.equal(clientAuthorization.ok, true)
   assert.equal(clientAuthorization.value.accountId, authorized.accountId)
-  assert.deepEqual(await clientCtx.remote.dshChat.loadWebsiteSession(metadata, clientAuthorization.value.epoch), { ok: true, value: null })
-  assert.deepEqual(await clientCtx.remote.dshChat.saveWebsiteSession(metadata, clientAuthorization.value.epoch, fictionalSession), { ok: true, value: true })
-  assert.deepEqual(await clientCtx.remote.dshChat.clearWebsiteSession(metadata, clientAuthorization.value.epoch), { ok: true, value: true })
-  const capturedSessionMethod = clientCtx.remote.dshChat.loadWebsiteSession
+  assert.deepEqual(await clientCtx.remote.dshDeepseekChat.loadWebsiteSession(metadata, clientAuthorization.value.epoch), { ok: true, value: null })
+  assert.deepEqual(await clientCtx.remote.dshDeepseekChat.saveWebsiteSession(metadata, clientAuthorization.value.epoch, fictionalSession), { ok: true, value: true })
+  assert.deepEqual(await clientCtx.remote.dshDeepseekChat.clearWebsiteSession(metadata, clientAuthorization.value.epoch), { ok: true, value: true })
+  const capturedSessionMethod = clientCtx.remote.dshDeepseekChat.loadWebsiteSession
   // A root Context bypasses plugin dependency enforcement. Keep the failing
   // shape covered explicitly so the integration cannot accidentally miss it.
   const missingDependency = clientCtx.plugin({
     name: 'fixture-missing-namespace-dependency', inject: ['remote'],
-    apply: (child: typeof clientCtx) => child.remote.dshChat.authorization(metadata),
+    apply: (child: typeof clientCtx) => child.remote.dshDeepseekChat.authorization(metadata),
   })
-  await assert.rejects(Promise.resolve(missingDependency), /remote\.dshChat.*without inject/)
+  await assert.rejects(Promise.resolve(missingDependency), /remote\.dshDeepseekChat.*without inject/)
   await missingDependency.dispose()
-  const capturedMethod = clientCtx.remote.dshChat.authorization
-  const clientStream = clientCtx.remote.dshChat.watchAuthorization(metadata)
+  const capturedMethod = clientCtx.remote.dshDeepseekChat.authorization
+  const clientStream = clientCtx.remote.dshDeepseekChat.watchAuthorization(metadata)
   const clientIterator = clientStream[Symbol.asyncIterator]()
   assert.equal((await clientIterator.next()).value.status, 'authorized')
 
   const abort = new AbortController()
   const stream = await ctx.typertGateway.stream({
-    namespace: 'dshChat', method: 'watchAuthorization', args: { metadata }, signal: abort.signal,
+    namespace: 'dshDeepseekChat', method: 'watchAuthorization', args: { metadata }, signal: abort.signal, peer: ownerPeer,
   })
   const iterator = stream[Symbol.asyncIterator]()
   const opening = await iterator.next()
   assert.equal(opening.value.status, 'authorized')
+  // The 2026-10-11 decision: DSH sign-out never gates CHAT, so neither stream
+  // publishes a new state and the Host gate keeps its profile scope and epoch.
   accountStatus = 'signed-out'
   ctx.emit('deepseek-account/signed-out')
-  const signedOut = await iterator.next()
-  assert.equal(signedOut.value.status, 'unauthorized')
-  assert.notEqual(signedOut.value.epoch, authorized.epoch)
-  assert.equal((await clientIterator.next()).value.status, 'unauthorized')
+  const afterSignOut = ctx.dshDeepseekChat.authority.getSnapshot()
+  assert.equal(afterSignOut.status, 'authorized')
+  assert.equal(afterSignOut.accountId, profileId)
+  assert.equal(afterSignOut.epoch, authorized.epoch)
   clientStream.dispose()
   await clientIterator.return?.()
   abort.abort()
   await iterator.return?.()
 
   await unmountClient()
-  assert.equal(clientCtx.get('remote.dshChat'), undefined)
+  assert.equal(clientCtx.get('remote.dshDeepseekChat'), undefined)
   const callsBeforeWithdrawal = carrierCalls
   assert.equal((await capturedMethod(metadata)).ok, false)
   assert.equal((await capturedSessionMethod(metadata, clientAuthorization.value.epoch)).ok, false)
@@ -322,8 +348,17 @@ test('published Cordis and Typert Host/Client bind strict methods and withdraw t
       })
       plugin.onLoad({ filter: /.*/, namespace: 'fixture' }, (args: { path: string }) => ({
         contents: args.path === './ui.js'
-          ? 'export const DshChatBrandName=()=>null, DshChatBrandControl=()=>null, DshChatChatNavigation=()=>null, DshChatChatPanel=()=>null, DshChatLeadingControls=()=>null, DshChatChatSettings=()=>null;'
+          ? 'export const DshChatBrandName=()=>null, DshChatBrandControl=()=>null, DshChatChatNavigation=()=>null, DshChatChatPanel=()=>null, DshChatSettingsIcon=()=>null, DshChatLeadingControls=()=>null, DshChatChatSettings=()=>null, guardHarnessSearchReplay=()=>null;'
           : 'export const DshChatWebSurface=()=>null;', loader: 'js',
+      }))
+      // The 0.2.2 SDK expects host-provided modules (clsx, shiki, ...); keep the
+      // visual primitives inert like every other fixture in this repository.
+      plugin.onResolve({ filter: /^@deepseek-ai\/dsh-client-ui-primitives$/ }, () => ({ path: 'primitives', namespace: 'sdk-inert' }))
+      plugin.onLoad({ filter: /.*/, namespace: 'sdk-inert' }, () => ({
+        contents: 'export const Button=()=>null, Input=()=>null, Menu=()=>null, Modal=()=>null, Tooltip=()=>null, BrandWordmark=()=>null,' +
+          'IconSearchOutlineRegular=()=>null, IconCloseFillRegular=()=>null, IconNewChatOutlineRegular=()=>null, IconPanelLeftOutlineRegular=()=>null,' +
+          'IconRefreshOutlineRegular=()=>null, IconLoadingOutlineRegular=()=>null, IconEllipsisOutlineRegular=()=>null, IconEditOutlineRegular=()=>null,' +
+          'IconPinOutlineRegular=()=>null, IconShareOutlineRegular=()=>null, IconTrashOutlineRegular=()=>null, IconChevronDownOutlineRegular=()=>null;', loader: 'js',
       }))
     } }],
   })
@@ -345,6 +380,8 @@ test('published Cordis and Typert Host/Client bind strict methods and withdraw t
   let panel: string | null = 'plugins'
   const panelListeners = new Set<() => void>()
   const slotKeys = new Set<string>()
+  const slotListeners = new Map<string, Set<() => void>>()
+  const notifySlots = (name: string) => { for (const listener of slotListeners.get(name) ?? []) listener() }
   class FixtureSlots extends Service {
     constructor(context: typeof clientCtx) { super(context, 'slots') }
     inject(_name: string, callback: () => unknown) { return this.ctx.effect(callback) }
@@ -352,7 +389,16 @@ test('published Cordis and Typert Host/Client bind strict methods and withdraw t
       const key = `${options.name}:${options.key ?? options.id ?? ''}`
       slotKeys.add(key)
       if (options.name === 'main') bridge = options.inject().bridge
-      return this.ctx.effect(() => () => { slotKeys.delete(key) })
+      notifySlots(options.name)
+      return this.ctx.effect(() => () => { slotKeys.delete(key); notifySlots(options.name) })
+    }
+    entries(name: string) {
+      return [...slotKeys].filter(key => key.startsWith(`${name}:`)).map(key => ({ name, key }))
+    }
+    subscribe(name: string, listener: () => void) {
+      const listeners = slotListeners.get(name) ?? new Set<() => void>()
+      slotListeners.set(name, listeners); listeners.add(listener)
+      return () => { listeners.delete(listener) }
     }
   }
   const fixtureSlots = clientCtx.plugin(FixtureSlots)
@@ -375,33 +421,46 @@ test('published Cordis and Typert Host/Client bind strict methods and withdraw t
     }
     assert.fail('production Client state did not settle')
   }
-  await until(() => bridge.getSnapshot().authorizationStatus === 'unauthorized')
-  assert.equal(bridge.getSnapshot().modeEnabled, false)
-  accountStatus = 'credential-stored'
-  ctx.emit('credentials/record-updated', 'deepseek-account-platform/default')
-  bridge.refreshAuthorization()
-  await until(() => bridge.getSnapshot().modeEnabled)
+  // The Host gate is profile-scoped since the 2026-10-11 decision: the DSH
+  // account never authorizes or disables CHAT, so the production Client settles
+  // authorized with the desktop capability as its only entry condition.
+  await until(() => bridge.getSnapshot().authorizationStatus === 'authorized')
+  assert.equal(bridge.getSnapshot().modeEnabled, true)
   assert.equal(bridge.getSnapshot().mode, 'harness')
   assert.equal(bridge.getSnapshot().error, null)
   bridge.selectMode('chat')
   await until(() => bridge.getSnapshot().mode === 'chat')
   accountStatus = 'signed-out'
   ctx.emit('deepseek-account/signed-out')
-  await until(() => bridge.getSnapshot().authorizationStatus === 'unauthorized')
-  assert.equal(bridge.getSnapshot().mode, 'harness')
-  assert.equal(panel, 'plugins')
+  await new Promise<void>(resolve => { setImmediate(resolve) })
+  assert.equal(bridge.getSnapshot().authorizationStatus, 'authorized')
+  assert.equal(bridge.getSnapshot().modeEnabled, true)
+  assert.equal(bridge.getSnapshot().mode, 'chat')
+  assert.equal(panel, 'dsh-deepseek-chat.chat')
   await production.dispose()
   assert.equal(slotKeys.size, 0)
-  assert.equal(clientCtx.get('remote.dshChat'), undefined)
+  assert.equal(clientCtx.get('remote.dshDeepseekChat'), undefined)
   await clientGateway.dispose()
   assert.equal(carrierStopped, true)
+
+  // Site login memory: its methods are reachable through the gateway. Placed
+  // after the nested grant tests so this read cannot disturb their records.
+  for (const method of ['loadSiteSession']) {
+    const result = await ctx.typertGateway.invoke({
+      namespace: 'dshDeepseekChat', method,
+      args: { metadata, epoch: authorized.epoch, site: 'chatgpt' }, peer: ownerPeer,
+    })
+    // The gateway unwraps a fulfilled RemoteResult to its value; with no
+    // stored grant a load answers null.
+    assert.equal(result, null, method + ' must be callable and answer null')
+  }
 
   await controller.dispose()
   disposed = true
   for (const method of ['authorization', 'watchAuthorization', 'loadWebsiteSession', 'saveWebsiteSession', 'clearWebsiteSession']) {
-    assert.equal(ctx.typert.local.get(`dshChat/${method}`), undefined)
+    assert.equal(ctx.typert.local.get(`dshDeepseekChat/${method}`), undefined)
   }
   await assert.rejects(ctx.typertGateway.invoke({
-    namespace: 'dshChat', method: 'authorization', args: { metadata },
+    namespace: 'dshDeepseekChat', method: 'authorization', args: { metadata }, peer: ownerPeer,
   }), (error: { code?: string }) => error.code === 'gateway/definition-unavailable')
 })

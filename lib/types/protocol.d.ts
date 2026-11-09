@@ -44,6 +44,59 @@ export declare const websiteSessionSchema: z.ZodObject<{
     userId: z.ZodString;
     deviceId: z.ZodString;
 }, z.core.$strict>;
+/**
+ * One captured cookie of a registered site. It travels only inside the plugin's
+ * own Host bridge and rests only in the profile-scoped credential vault.
+ */
+export interface SiteCookie {
+    name: string;
+    value: string;
+    domain: string;
+    path: string;
+    secure: boolean;
+    httpOnly: boolean;
+    sameSite: 'strict' | 'lax' | 'none' | 'unspecified';
+    /** Epoch seconds; null is a session cookie. */
+    expires: number | null;
+}
+export declare const siteCookieSchema: z.ZodObject<{
+    name: z.ZodString;
+    value: z.ZodString;
+    domain: z.ZodString;
+    path: z.ZodString;
+    secure: z.ZodBoolean;
+    httpOnly: z.ZodBoolean;
+    sameSite: z.ZodEnum<{
+        strict: "strict";
+        lax: "lax";
+        none: "none";
+        unspecified: "unspecified";
+    }>;
+    expires: z.ZodNullable<z.ZodNumber>;
+}, z.core.$strict>;
+/** A site's remembered login: the minimal sufficient cookie set, nothing else. */
+export interface SiteSession {
+    site: string;
+    cookies: readonly SiteCookie[];
+}
+export declare const siteSessionSchema: z.ZodObject<{
+    site: z.ZodString;
+    cookies: z.ZodArray<z.ZodObject<{
+        name: z.ZodString;
+        value: z.ZodString;
+        domain: z.ZodString;
+        path: z.ZodString;
+        secure: z.ZodBoolean;
+        httpOnly: z.ZodBoolean;
+        sameSite: z.ZodEnum<{
+            strict: "strict";
+            lax: "lax";
+            none: "none";
+            unspecified: "unspecified";
+        }>;
+        expires: z.ZodNullable<z.ZodNumber>;
+    }, z.core.$strict>>;
+}, z.core.$strict>;
 /** Explicit strict descriptors use the public registry; no source-mode method discovery. */
 export declare const DSH_CHAT_DESCRIPTORS: readonly InvocationDescriptor[];
 export declare const DSH_CHAT_REMOTE_CONTRIBUTION: TypertRemoteContribution;
@@ -55,6 +108,9 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
         'dshDeepseekChat/loadWebsiteSession': (metadata: DshChatClientMetadata, epoch: string, signal?: AbortSignal) => Promise<RemoteResult<WebsiteSession | null>>;
         'dshDeepseekChat/saveWebsiteSession': (metadata: DshChatClientMetadata, epoch: string, session: WebsiteSession, signal?: AbortSignal) => Promise<RemoteResult<boolean>>;
         'dshDeepseekChat/clearWebsiteSession': (metadata: DshChatClientMetadata, epoch: string, signal?: AbortSignal) => Promise<RemoteResult<boolean>>;
+        'dshDeepseekChat/saveSiteSession': (metadata: DshChatClientMetadata, epoch: string, site: string, cookies: readonly SiteCookie[], signal?: AbortSignal) => Promise<RemoteResult<boolean>>;
+        'dshDeepseekChat/loadSiteSession': (metadata: DshChatClientMetadata, epoch: string, site: string, signal?: AbortSignal) => Promise<RemoteResult<SiteSession | null>>;
+        'dshDeepseekChat/clearSiteSession': (metadata: DshChatClientMetadata, epoch: string, site: string, signal?: AbortSignal) => Promise<RemoteResult<boolean>>;
     }
     interface TypertRemoteNamespaceMap {
         dshDeepseekChat: import('@deepseek-ai/dsh-typert-protocol').TypertRemoteNamespace<'dshDeepseekChat'>;

@@ -11,7 +11,8 @@ import { CHAT_PANEL, ModeController } from './core/mode.js'
 import { readHostLanguage, type ChatLanguage } from './website-settings.js'
 import { translate } from './i18n.js'
 import { authorizationSchema, DSH_CHAT_REMOTE_CONTRIBUTION } from './protocol.js'
-import type { AuthorizationState, DshChatClientMetadata, WebsiteSession } from './protocol.js'
+import type { AuthorizationState, DshChatClientMetadata, SiteCookie, SiteSession, WebsiteSession } from './protocol.js'
+import type { WebsiteNavigation } from './website-navigation.js'
 import { acquireChatStyles } from './styles.js'
 import { guardHarnessSearchReplay, DshChatBrandName, DshChatChatNavigation, DshChatChatPanel, DshChatLeadingControls, DshChatChatSettings, DshChatSettingsIcon } from './ui.js'
 import type { DshChatUIBridge, DshChatViewState, DshChatViewportRect, WebsiteNotice } from './ui.js'
@@ -23,6 +24,10 @@ import { parseWebsiteDownload, websiteDownloadBlob } from './website-downloads.j
 import type { WebsiteFile } from './website-downloads.js'
 import { createSidebarBinding } from './sidebar-adapter.js'
 import { bindChatSettingsIconSlot, CHAT_SETTINGS_SECTION_ID } from './settings-icon.js'
+import { CHAT_SITES, allSites, siteById, type ChatSite } from './sites.js'
+import { parseSiteCookies } from './site-navigation.js'
+import { addCustomSite, loadCustomSites, removeCustomSite } from './custom-sites.js'
+import { readStoredSite, writeStoredSite } from './site-preference.js'
 import { HOST_ENTRY_ID } from './identity.js'
 import { DEFAULT_SWITCH_PREFERENCES, parseSwitchPreferences, validSwitchLabel, type SwitchPreferences } from './preferences.js'
 import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client'
@@ -93,6 +98,7 @@ export function apply(ctx: Context): void {
   let websiteNoticeTimer: ReturnType<typeof setTimeout> | undefined
   let fileActions: FileActions | null = null
   let websiteFileSaving = false
+  let currentSite: ChatSite = typeof document === 'undefined' ? siteById('deepseek') : readStoredSite()
   let preferencesForm: ConfigForm<SwitchPreferences>|null = null
   let bridge: DshChatUIBridge
   let cached: DshChatViewState
@@ -139,12 +145,16 @@ export function apply(ctx: Context): void {
         ? '当前 DSH 未提供可信配置上下文，网页登录可用，但不能保存登录记忆。'
         : state.authorization.error ? 'CHAT 登录保存服务暂时不可用，请重试连接。' : null),
       desktopAvailable: Boolean(nativeBrowser), webLoading, webError, settingsOpen, language, viewport, brandAnchor, sidebarAdapted,
+      siteLogin, siteImportError, siteImportWarning,
+      // Only the user's own sites; the built-ins are known to every surface.
+      customSites: allSites(customSites).slice(CHAT_SITES.length),
       websiteSessionStatus, websiteSessionError, websiteAuthenticationStatus, websiteAuthenticationRevision,
       accountStorageKey: state.authorization.status === 'authorized' && state.authorization.accountId
         ? `dsh-deepseek-chat:website:${state.authorization.accountId}` : null,
       authorizationGeneration, websiteReloadRevision, websiteNavigationRefreshing, websiteNavigationRefreshError, websiteNavigation, showWebsiteNavigation,
-      switchPreferences, switchPreferencesStatus, switchPreferencesError, switchPreferencesPending:preferenceWrites>0,
       websiteNotice,
+      site: currentSite.id,
+      switchPreferences, switchPreferencesStatus, switchPreferencesError, switchPreferencesPending:preferenceWrites>0,
     }
     sidebar?.sync()
     for (const listener of listeners) listener()
@@ -160,6 +170,15 @@ export function apply(ctx: Context): void {
       websiteNotice = null
       publish()
     }, notice === 'download-saved' || notice === 'download-requested' ? 2500 : 5000)
+  }
+  /** Whether a re-report carries anything new. The adapter polls about once a
+   * second, and re-rendering an unchanged list makes the sidebar flicker. */
+  function sameNavigation(a: WebsiteNavigation, b: WebsiteNavigation): boolean {
+    return a.status === b.status && a.authenticated === b.authenticated
+      && a.selectedHref === b.selectedHref && a.canCreate === b.canCreate
+      && a.error === b.error && a.conversations.length === b.conversations.length
+      && a.conversations.every((item, index) => item.href === b.conversations[index].href
+        && item.title === b.conversations[index].title && item.group === b.conversations[index].group)
   }
   function resetNavigationRefresh(): void {
     websiteNavigationRefreshRequest++
@@ -338,6 +357,121 @@ export function apply(ctx: Context): void {
     pendingSessionClear=clearing
     return clearing
   }
+
+  /** Sites whose login memory this plugin owns; DeepSeek keeps its own path. */
+  const SITE_SESSION_IDS: readonly string[] = ['chatgpt', 'claude', 'gemini']
+  let customSites: readonly ChatSite[] = loadCustomSites()
+  let siteLogin: Readonly<Record<string, boolean>> = {}
+  let siteImportError: string | null = null
+  /** Site the last navigation report belonged to; a switch starts empty. */
+  let navigationSite: string | null = null
+  let siteImportWarning: string | null = null
+  /** The guest the surface currently drives; site-session calls reuse it. */
+  let siteGuest: { generation: number; partition: string } | null = null
+
+  async function siteRequest<T>(
+    generation: number,
+    operation: (fence: { accountId: string; epoch: string }, signal: AbortSignal) => Promise<T>,
+  ): Promise<T | null> {
+    const fence = sessionFence(generation)
+    if (!fence) return null
+    try {
+      return await websiteRequest(async signal => {
+        await connectRemote()
+        if (!remoteContext || signal.aborted || !sameSessionFence(generation, fence)) {
+          throw new Error('Site session invalidated')
+        }
+        return operation(fence, signal)
+      })
+    } catch { return null }
+  }
+
+  function publishSiteLogin(entries: Record<string, boolean>): void {
+    siteLogin = Object.freeze({ ...siteLogin, ...entries })
+    publish()
+  }
+
+  /**
+   * Parses one pasted cookie line ("name=value; name2=value2", the format browser
+   * dev tools and cookie-export extensions produce) into the plugin's own shape,
+   * keeping only this site's confirmed login-cookie names.
+   */
+  /** Stores an imported cookie set; returns how many cookies were accepted. */
+  /** Which of a site's login tokens a parsed import is still missing. */
+  function missingAuthCookies(site: string, cookies: readonly SiteCookie[]): string[] {
+    const present = new Set(cookies.map(cookie => cookie.name))
+    return siteById(site).authCookies.filter(name => !present.has(name))
+  }
+
+  async function importSiteSession(site: string, text: string): Promise<number> {
+    const guest = siteGuest
+    if (guest === null) return 0
+    const cookies = parseSiteCookies(site, text, customSites)
+    if (cookies.length === 0) return 0
+    // The login token itself must be present; the rest is imported when copied
+    // and only warned about, so a partial copy still restores a working login.
+    const missing = missingAuthCookies(site, cookies)
+    const missingRequired = siteById(site).requiredAuthCookies.filter(name => !cookies.some(cookie => cookie.name === name))
+    if (missingRequired.length > 0) {
+      const recognized = cookies.map(cookie => cookie.name).join('、')
+      siteImportError = '没有找到登录令牌（' + missingRequired.join('、')
+        + '）。已识别到 ' + cookies.length + ' 项：' + recognized
+        + '。请在开发者工具里确认已登录该网站，并完整复制所有 Cookie 行。'
+      publish()
+      return 0
+    }
+    siteImportWarning = missing.length > 0 ? '已保存，但还缺少：' + missing.join('、') + '（部分网站功能可能需要）。' : null
+    const saved = await siteRequest(guest.generation, async (fence, signal) => {
+      const result = await remoteContext!.remote.dshDeepseekChat.saveSiteSession(metadata, fence.epoch, site, cookies, signal)
+      return result.ok ? result.value === true : false
+    })
+    if (saved === true) { siteImportError = null; publishSiteLogin({ [site]: true }) }
+    return saved === true ? cookies.length : 0
+  }
+
+  /** Loads one site's stored cookies so the surface can write them into the guest. */
+  async function loadSiteSession(generation: number, site: string): Promise<SiteSession | null> {
+    return siteRequest(generation, async (fence, signal) => {
+      const result = await remoteContext!.remote.dshDeepseekChat.loadSiteSession(metadata, fence.epoch, site, signal)
+      return result.ok ? result.value : null
+    })
+  }
+
+  /** Forgets one site's stored cookies. */
+  async function clearSiteLogin(site: string): Promise<boolean> {
+    const guest = siteGuest
+    if (guest === null) return false
+    const cleared = await siteRequest(guest.generation, async (fence, signal) => {
+      const result = await remoteContext!.remote.dshDeepseekChat.clearSiteSession(metadata, fence.epoch, site, signal)
+      return result.ok ? result.value === true : false
+    })
+    if (cleared === true) publishSiteLogin({ [site]: false })
+    return cleared === true
+  }
+
+  /** Whether the guest currently holds each site's session cookie. */
+  function probeSiteLogins(reports: Record<string, boolean>): void {
+    publishSiteLogin(reports)
+  }
+  /** Persist one volatile preference through the official settings form. */
+  async function saveSwitchPreference(field: keyof SwitchPreferences, value: string): Promise<boolean> {
+    if (disposed) return false
+    if (field === 'switchStyle' ? !['text','icon'].includes(value) : !validSwitchLabel(value)) return false
+    const form = preferencesForm
+    if (!form || switchPreferencesStatus !== 'ready' || !form.getSnapshot().writable) {
+      switchPreferencesError='设置服务尚未就绪，请重启 DSH 后重试。';publish();return false
+    }
+    preferenceWrites++;switchPreferencesError=null;publish()
+    try {
+      const accepted=await form.set(field,value)
+      // Only an accepted write may refresh the mirror; a rejected write keeps
+      // the on-screen state (the guest already shows the selected site).
+      if(!disposed && preferencesForm===form && accepted) switchPreferences=parseSwitchPreferences(form.getSnapshot().value)
+      if(!disposed && preferencesForm===form) switchPreferencesError=accepted ? null : '设置保存失败，请重试。'
+      return accepted
+    } catch {if(!disposed && preferencesForm===form)switchPreferencesError='设置保存失败，请重试。';return false}
+    finally {preferenceWrites--;publish()}
+  }
   bridge = {
     getSnapshot: () => cached,
     subscribe: listener => { listeners.add(listener); return () => { listeners.delete(listener) } },
@@ -376,7 +510,42 @@ export function apply(ctx: Context): void {
       webLoading = state.loading; webError = state.error; publish()
       if (recovered && !websiteNavigationRefreshing) {websiteNavigationRefreshError=null;publish()}
     },
-    reloadWebsite: () => { resetNavigationRefresh();websiteReloadRevision++;publish() },
+    addCustomSite: (label: string, url: string, icon: string) => {
+      if (disposed) return false
+      const next = addCustomSite(customSites, label, url, icon)
+      if (next === null) return false
+      customSites = next
+      publish()
+      return true
+    },
+    removeCustomSite: (id: string) => {
+      if (disposed) return
+      const next = removeCustomSite(customSites, id)
+      if (next.length === customSites.length) return
+      customSites = next
+      // Leaving a removed site must not keep its stale navigation on screen.
+      if (siteById(bridge.getSnapshot().site, customSites).id !== bridge.getSnapshot().site) bridge.selectSite(CHAT_SITES[0].id)
+      publish()
+    },    reloadWebsite: () => { resetNavigationRefresh();websiteReloadRevision++;publish() },
+    selectSite: (id: string) => {
+      if (disposed) return
+      const site = siteById(id, customSites)
+      // siteById falls back to the default site, so compare ids to reject unknown ones.
+      if (site.id !== id || site.id === currentSite.id) return
+      // A site change is a fresh document: every per-site observation is reset
+      // and the retained guest navigates to the new landing URL. The choice is
+      // local UI state, so it never re-activates the plugin's Host config.
+      resetNavigationRefresh()
+      websiteNavigation = emptyNavigation(); navigationHandler = null; windowDragSampler = null; showWebsiteNavigation = false
+      websiteSignedOut=false; restorationBlocked=false; logoutRequested=false; logoutFailed=false; logoutVaultCleared=false
+      forgettingWebsiteSession=false; websiteHadSession=false; websiteSignInRequested=false
+      websiteSessionStatus='idle'; websiteSessionError=null
+      websiteAuthenticationStatus='loading'; websiteAuthenticationRevision++
+      webLoading=true; webError=null
+      currentSite = site
+      writeStoredSite(site.id)
+      publish()
+    },
     refreshWebsiteNavigation: () => {
       if (disposed || !mode.canEnter() || !nativeBrowser || websiteNavigationRefreshing || webLoading
         || websiteNavigation.authenticated!==true || logoutRequested || logoutFailed
@@ -399,6 +568,18 @@ export function apply(ctx: Context): void {
       let next: typeof websiteNavigation
       try { next=parseWebsiteNavigation(value) } catch { next={status:'unsupported',conversations:[],selectedHref:null,canCreate:false,error:null} }
       const previousNavigation=websiteNavigation
+      const previousAuthStatus=websiteAuthenticationStatus
+      // A collapsed site sidebar, a mid-navigation page or the reload that
+      // follows a conversation click can momentarily expose no links. That is
+      // not "no conversations", so the last known list survives until the site
+      // reports a sign-in. Only a switch to another site starts empty.
+      const reportSite = bridge.getSnapshot().site
+      const sameSite = navigationSite === reportSite
+      navigationSite = reportSite
+      if (sameSite && next.status !== 'sign-in' && next.conversations.length === 0
+        && previousNavigation.status === 'ready' && previousNavigation.conversations.length > 0) {
+        next = { ...next, status: 'ready', authenticated: true, conversations: previousNavigation.conversations, selectedHref: previousNavigation.selectedHref }
+      }
       if (newDocument && next.authenticated!==true && next.status!=='sign-in' && !logoutRequested && !logoutFailed) {
         websiteAuthenticationStatus=websiteSignInRequested ? 'signing-in' : 'loading'
       }
@@ -435,6 +616,10 @@ export function apply(ctx: Context): void {
       }
       if (websiteNavigation.status==='ready' && websiteNavigation.authenticated===true && !websiteNavigationRefreshing
         && websiteNavigationRefreshError==='官网对话列表同步超时，请点击「重新加载」。') websiteNavigationRefreshError=null
+      // A poll that reports an unchanged list must not re-render the sidebar;
+      // the login bookkeeping above still ran, so status stays correct.
+      if (!newDocument && sameNavigation(previousNavigation, next) && previousAuthStatus===websiteAuthenticationStatus
+        && previousNavigation.selectedHref===websiteNavigation.selectedHref && !websiteNavigationRefreshing) return
       publish()
     },
     bindWebsiteNavigation: (generation, handler) => {
@@ -593,6 +778,11 @@ export function apply(ctx: Context): void {
       return saving
     },
     clearWebsiteSession,
+    importSiteSession: (site, text) => importSiteSession(site, text),
+    loadSiteSession: (generation, site) => loadSiteSession(generation, site),
+    clearSiteLogin: site => clearSiteLogin(site),
+    probeSiteLogins: reports => { probeSiteLogins(reports) },
+    reportSiteGuest: (generation, partition) => { siteGuest = { generation, partition } },
     reportWebsiteSessionError: (generation,message) => {
       if(!sessionFence(generation) || logoutRequested || forgettingWebsiteSession || logoutFailed) return
       if(websiteSessionStatus==='error' && websiteSessionError===message) return
