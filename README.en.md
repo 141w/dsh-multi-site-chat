@@ -52,13 +52,13 @@ After a normal sign-in, the plugin attempts to save the website grant and restor
 Enter this in the DSH plugin installer:
 
 ```text
-dsh-deepseek-chat@0.2.20
+dsh-multi-site-chat@0.2.20
 ```
 
 Or use the CLI:
 
 ```bash
-dsh plugin --profile desktop add dsh-deepseek-chat@0.2.20
+dsh plugin --profile desktop add dsh-multi-site-chat@0.2.20
 ```
 
 Use the same method for a first installation or an update. If DSH’s release age policy temporarily blocks a newly published version, retry later.
@@ -68,13 +68,13 @@ Use the same method for a first installation or an update. If DSH’s release ag
 Paste this URL into the DSH plugin installer:
 
 ```text
-https://github.com/xingxingbk-git/dsh-deepseek-chat
+https://github.com/141w/dsh-deepseek-chat
 ```
 
 Or use the CLI:
 
 ```bash
-dsh plugin --profile desktop add https://github.com/xingxingbk-git/dsh-deepseek-chat
+dsh plugin --profile desktop add https://github.com/141w/dsh-deepseek-chat
 ```
 
 This installs the version already pushed to the repository, with no manual build required. Git must be installed; on Windows, install [Git for Windows](https://git-scm.com/install/windows) if needed, then reopen DSH.
@@ -84,7 +84,7 @@ This installs the version already pushed to the repository, with no manual build
 Give the `.tgz` package to the DSH plugin manager, or run:
 
 ```bash
-dsh plugin --profile desktop add /absolute/path/dsh-deepseek-chat-0.2.20.tgz
+dsh plugin --profile desktop add /absolute/path/dsh-multi-site-chat-0.2.20.tgz
 ```
 
 Replace the path with your package location.
@@ -128,5 +128,5 @@ The plugin does not include passwords, cookies or message bodies in login memory
 Remove the plugin through the DSH plugin manager, or run:
 
 ```bash
-dsh plugin --profile desktop remove dsh-deepseek-chat
+dsh plugin --profile desktop remove dsh-multi-site-chat
 ```
