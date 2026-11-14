@@ -16,7 +16,7 @@ export const chatStyles = String.raw`
 .dsh-chat-mode-compact .dsh-chat-modes{flex-direction:column;width:30px;gap:3px}.dsh-chat-mode-compact .dsh-chat-modes button{width:24px;padding:4px 2px}
 [data-dsh-chat-brand-fill="identity"]{flex:1;width:100%}
 [data-dsh-chat-brand-fill="name"]{flex:1}
-[data-dsh-chat-sidebar-mode="chat"] > [data-dsh-chat-panel-region="true"]{display:none}
+[data-dsh-chat-sidebar-mode="chat"] [data-dsh-chat-panel-region="true"]{display:none}
 [data-dsh-chat-sidebar-mode="chat"] [data-dsh-chat-new-session="true"]:disabled{opacity:.45;cursor:default}
 .dsh-chat-brand-name{display:inline-flex;align-items:center;gap:6px;min-width:0;max-width:100%;flex:1;width:100%}
 [data-dsh-chat-brand-fill="brand"]{flex:0 0 auto;min-width:max-content}

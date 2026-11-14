@@ -52,13 +52,13 @@ DeepSeek Chat 是一款 **DSH 桌面插件**。选择 **CHAT**，即可在 DSH �
 在 DSH 插件安装输入框中输入：
 
 ```text
-dsh-multi-site-chat@0.2.20
+dsh-deepseek-chat@0.2.20
 ```
 
 也可以使用命令行：
 
 ```bash
-dsh plugin --profile desktop add dsh-multi-site-chat@0.2.20
+dsh plugin --profile desktop add dsh-deepseek-chat@0.2.20
 ```
 
 首次安装和更新已有插件均可使用。刚发布的版本若被 DSH 的发布时间策略暂时拦截，可稍后重试。
@@ -84,7 +84,7 @@ dsh plugin --profile desktop add https://github.com/141w/dsh-multi-site-chat
 将 `.tgz` 安装包交给 DSH 插件管理器，或使用命令行：
 
 ```bash
-dsh plugin --profile desktop add /absolute/path/dsh-multi-site-chat-0.2.20.tgz
+dsh plugin --profile desktop add /absolute/path/dsh-deepseek-chat-0.2.20.tgz
 ```
 
 将路径替换为实际安装包位置。
@@ -128,5 +128,5 @@ dsh plugin --profile desktop add /absolute/path/dsh-multi-site-chat-0.2.20.tgz
 在 DSH 插件管理器中移除，或执行：
 
 ```bash
-dsh plugin --profile desktop remove dsh-multi-site-chat
+dsh plugin --profile desktop remove dsh-deepseek-chat
 ```

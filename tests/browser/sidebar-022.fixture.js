@@ -27,6 +27,23 @@ window.fixtureDone=(async()=>{
     return {root,row,brand,identity,seat,outlet,name,nav,workspace,workspaceSlot,footer,newButton,toggle,panelButton,state,calls,makeButton,
       attach:()=>attachSidebarAdapter(name,()=>state,()=>calls.chat++)}
   }
+  function shellRc3() {
+    const root=node('div'),row=node('div',{'data-window-drag':'true'}),brand=node('span'),identity=node('span',{'aria-hidden':'true'})
+    const mark=node('span'),seat=node('span'),outlet=node('span',{'data-slot':'sidebar.brand.name'}),name=node('span')
+    const actionHost=node('div'),actionSlot=node('div',{'data-slot':'sidebar.session.action'})
+    const panelHost=node('div'),panelInner=node('div')
+    const nav=node('nav',{'aria-label':'Fictional global panels'}),panelButton=node('button')
+    mark.textContent='Fictional mark';name.textContent='Fictional plugin';panelButton.textContent='Fictional panel'
+    const state={chat:true,canCreate:true},calls={chat:0,native:0,other:0}
+    const newButton=node('button',{'type':'button'});newButton.append(node('span'));newButton.firstChild.textContent='Fictional new session'
+    newButton.addEventListener('click',()=>calls.native++)
+    outlet.append(name);seat.append(outlet);identity.append(mark,seat);brand.append(identity);row.append(brand)
+    actionSlot.append(newButton);actionHost.append(actionSlot)
+    nav.append(panelButton);panelInner.append(nav);panelHost.append(panelInner)
+    root.append(row,actionHost,panelHost);document.body.append(root)
+    return {root,row,brand,identity,seat,outlet,name,nav,actionHost,actionSlot,newButton,panelButton,state,calls,
+      attach:()=>attachSidebarAdapter(name,()=>state,()=>calls.chat++)}
+  }
   const remove=f=>f.root.remove()
   {
     const f=shell(),adapter=f.attach()
@@ -148,6 +165,21 @@ window.fixtureDone=(async()=>{
     check('fallback own-seat chain still supports the strict no-button shape',adapter?.valid())
     adapter.dispose()
     check('pre-existing root, NAV and brand attributes restore exactly',f.root.getAttribute(mode)==='native-mode' && f.nav.getAttribute(panel)==='native-panel' && f.brand.getAttribute(fill)==='native-brand')
+    remove(f)
+  }
+  {
+    const f=shellRc3()
+    const adapter=f.attach()
+    check('rc.3 accepts the deeper session.action button and nested panel NAV',adapter?.valid())
+    check('rc.3 leaves no direct-child NAV to invent',f.root.querySelectorAll(':scope > nav').length===0)
+    check('rc.3 marks the nested panel NAV for CHAT hiding',f.nav.getAttribute(panel)==='true')
+    check('rc.3 new-session control is the proven button',f.newButton.getAttribute(session)==='true')
+    check('rc.3 CHAT hides the nested panel NAV',getComputedStyle(f.nav).display==='none')
+    check('rc.3 brand and own name receive only scoped fill markers',f.brand.getAttribute(fill)==='brand' && f.seat.getAttribute(fill)==='name')
+    f.state.chat=false;adapter.sync()
+    check('rc.3 HARNESS restores the nested panel NAV',getComputedStyle(f.nav).display!=='none')
+    adapter.dispose();adapter.dispose()
+    check('rc.3 cleanup restores all owned attributes',clean(f.root) && f.name.parentElement===f.outlet)
     remove(f)
   }
   releaseStyles()
