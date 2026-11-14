@@ -28,23 +28,27 @@ export function attachSidebarAdapter(
   read: () => SidebarAdapterState,
   create: () => void,
 ): { sync(): void; valid(): boolean; dispose(): void } | null {
-  // The renderer's addressable SlotOutlet is display:contents, but remains a DOM ancestor.
-  const outlet = name.parentElement
-  const nameSeat = outlet?.getAttribute('data-slot') === 'sidebar.brand.name'
-    ? outlet.parentElement : outlet
-  const identity = nameSeat?.parentElement
-  const brand = identity?.parentElement
-  const row = brand?.parentElement
-  const root = row?.parentElement
-  if (!nameSeat || !identity || !brand || !row || !root
-    || identity.getAttribute('aria-hidden') !== 'true'
+  // Walk up from our own brand seat to the addressable identity row. rc.1 kept
+  // data-slot on the outlet; rc.2/rc.3 dropped it, so the stable markers are
+  // the identity row (aria-hidden, exactly two children: mark plus our name)
+  // and, above it, the draggable brand row.
+  const outlet = name.parentElement as HTMLElement
+  let identity: Element | null = null
+  let node: Element | null = outlet
+  for (let depth = 0; node !== null && depth < 4; depth++) {
+    if (node.getAttribute('aria-hidden') === 'true' && node.children.length === 2) { identity = node; break }
+    node = node.parentElement
+  }
+  const brand = identity?.parentElement ?? null
+  const row = brand?.parentElement ?? null
+  const root = row?.parentElement ?? null
+  if (identity === null || brand === null || row === null || root === null
     || !row.hasAttribute('data-window-drag') || identity.children.length !== 2) return null
-  const anchorValid = () => name.isConnected && name.parentElement === outlet
-    && (outlet === nameSeat || outlet?.parentElement === nameSeat)
-    && nameSeat.parentElement === identity && identity.parentElement === brand
+  // Our seat must stay inside that identity row, whatever wrappers sit between.
+  const anchorValid = () => name.isConnected && outlet !== null
+    && identity.contains(name) && identity.getAttribute("aria-hidden") === "true"
+    && identity.children.length === 2 && row.hasAttribute("data-window-drag")
     && brand.parentElement === row && row.parentElement === root
-    && identity.getAttribute('aria-hidden') === 'true' && identity.children.length === 2
-    && row.hasAttribute('data-window-drag')
   const controls = (): { button: HTMLButtonElement | null; navs: Element[] } | null => {
     if (!anchorValid()) return null
     const next = row.nextElementSibling, children = Array.from(root.children)
@@ -55,6 +59,25 @@ export function attachSidebarAdapter(
     // 0.2.2 session/create denial removes that button AND makes the brand a SPAN.
     // Prove its labelled NAV and immediately following workspace region locally;
     // zero buttons alone is not evidence that an arbitrary shell is supported.
+    // 0.2.2-rc.3: the new-session control moved one level deeper — the row's next
+    // sibling is a plain DIV wrapping a data-slot=sidebar.session.action container
+    // that holds the single button; the global panel NAV is its next sibling's
+    // descendant. Prove both locally before touching anything.
+    const actionHost = next?.tagName === 'DIV' ? next : null
+    const actionSlot = actionHost?.querySelector('[data-slot="sidebar.session.action"]')
+    const actionButton = actionSlot?.querySelector('button')
+    const panelNav = actionHost?.nextElementSibling?.querySelector('nav[aria-label]')
+    if (actionHost !== null && actionSlot !== null && actionSlot !== undefined
+      && actionButton !== null && actionButton !== undefined
+      && actionHost.tagName === 'DIV' && actionSlot.parentElement === actionHost
+      && actionButton.parentElement === actionSlot
+      && panelNav !== null && panelNav !== undefined
+      && root.contains(panelNav) && navs.length === 0
+      && (panelNav.getAttribute('aria-label') || '').trim().length > 0) {
+      // rc.3 keeps the NAV below the root's direct children, so the panel to hide
+      // is the one we proved, not the (empty) direct-child list.
+      return { button: actionButton as HTMLButtonElement, navs: [panelNav] }
+    }
     if (brand.tagName !== 'SPAN' || buttons.length !== 0 || next?.tagName !== 'NAV'
       || navs.length !== 1 || !next.getAttribute('aria-label')?.trim()) return null
     const regions = children.filter(element => Array.from(element.children).some(child => child.getAttribute('data-slot') === 'sidebar.workspaces'))
@@ -109,7 +132,7 @@ export function attachSidebarAdapter(
     bindButton(current.button)
     mark(brand, 'data-dsh-chat-brand-fill', 'brand')
     mark(identity, 'data-dsh-chat-brand-fill', 'identity')
-    mark(nameSeat, 'data-dsh-chat-brand-fill', 'name')
+    mark(name.parentElement?.parentElement ?? name, 'data-dsh-chat-brand-fill', 'name')
     mark(root, 'data-dsh-chat-sidebar-mode', state.chat ? 'chat' : 'harness')
     if (newButton) newButton.disabled = state.chat ? !state.canCreate : originallyDisabled
     const nextNavigation = new Set(current.navs)
